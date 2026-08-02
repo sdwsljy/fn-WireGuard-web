@@ -1,0 +1,56 @@
+#!/bin/bash
+# 安装完成处理（升级/覆盖安装同样执行本脚本）：
+set -u
+APP_NAME="fn-wg-web"
+TARGET="${TRIM_APPDEST:-/usr/local/apps/@appcenter/fn-wg-web}"
+UI_LINK="/var/apps_ui/${APP_NAME}"
+DEST="/usr/fn-wg-web"
+DATA_DIR="/var/apps/fn-wg-web/var"
+
+mkdir -p "$DATA_DIR"
+if [ -f "$DATA_DIR/state.json" ]; then
+    echo "[fn-wg-web] 配置已在官方持久卷（升级/覆盖安装保留），直接使用"
+elif [ -f "$DEST/state.json" ]; then
+    cp -f "$DEST/state.json" "$DATA_DIR/state.json" 2>/dev/null || true
+    echo "[fn-wg-web] 已从旧运行目录迁移配置到持久卷"
+else
+    echo "[fn-wg-web] 全新安装，无历史配置"
+fi
+
+if [ -f "$DATA_DIR/state.json" ]; then
+    if docker inspect wireguard >/dev/null 2>&1; then
+        python3 -c "
+import json
+p = '$DATA_DIR/state.json'
+s = json.load(open(p))
+s.setdefault('container', {})['deployed'] = True
+json.dump(s, open(p, 'w'), ensure_ascii=False, indent=2)
+" 2>/dev/null || true
+        echo "[fn-wg-web] 检测到 wireguard 容器仍在运行，状态保持已部署，无需重新部署"
+    else
+        python3 -c "
+import json
+p = '$DATA_DIR/state.json'
+s = json.load(open(p))
+s.setdefault('container', {})['deployed'] = False
+json.dump(s, open(p, 'w'), ensure_ascii=False, indent=2)
+" 2>/dev/null || true
+    fi
+fi
+
+OK=1
+if [ ! -f "$TARGET/ui/config" ]; then
+    echo "[fn-wg-web] 错误: target/ui/config 不存在，桌面图标将无法注册"; OK=0
+else
+    echo "[fn-wg-web] ui/config 就位，图标定义正常"
+fi
+if [ ! -f "$TARGET/ui/images/icon.png" ]; then
+    echo "[fn-wg-web] 警告: target/ui/images/icon.png 缺失，图标可能显示异常"
+fi
+if [ -L "$UI_LINK" ]; then
+    echo "[fn-wg-web] 桌面图标链接已建立: $UI_LINK -> $(readlink "$UI_LINK")"
+else
+    echo "[fn-wg-web] 警告: 桌面图标链接 $UI_LINK 不存在"
+fi
+[ "$OK" -eq 1 ] && echo "[fn-wg-web] 安装完成，桌面图标注册文件齐全"
+exit 0

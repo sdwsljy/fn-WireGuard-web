@@ -1,0 +1,9 @@
+#!/bin/bash
+# 卸载前检查
+if [ -f /usr/fn-wg-web/state.json ]; then
+    count=$(python3 -c "import json;print(len(json.load(open('/usr/fn-wg-web/state.json')).get('peers',[])))" 2>/dev/null)
+    if [ -n "$count" ] && [ "$count" -gt 0 ] 2>/dev/null; then
+        echo "当前有 ${count} 个 WireGuard 客户端，卸载后这些客户端将全部失效！"
+    fi
+fi
+exit 0

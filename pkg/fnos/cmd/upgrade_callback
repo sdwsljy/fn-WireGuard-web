@@ -1,0 +1,39 @@
+#!/bin/bash
+# 升级后处理：
+set -u
+APP_NAME="fn-wg-web"
+DEST="/usr/fn-wg-web"
+DATA_DIR="/var/apps/fn-wg-web/var"
+STATE_FILE="$DATA_DIR/state.json"
+
+if [ -d "$TRIM_APPDEST" ] && [ -d "$DEST" ]; then
+    cp -f "$TRIM_APPDEST"/wg-manager.py "$DEST/" 2>/dev/null || true
+    cp -rf "$TRIM_APPDEST"/web "$DEST/" 2>/dev/null || true
+    chmod +x "$DEST/wg-manager.py" 2>/dev/null || true
+fi
+mkdir -p "$DATA_DIR"
+if [ ! -f "$STATE_FILE" ] && [ -f "$DEST/state.json" ]; then
+    cp -f "$DEST/state.json" "$STATE_FILE" 2>/dev/null || true
+    echo "[fn-wg-web] 升级：已迁移旧配置到持久卷"
+fi
+if [ -f "$STATE_FILE" ]; then
+    if docker inspect wireguard >/dev/null 2>&1; then
+        python3 -c "
+import json
+p = '$STATE_FILE'
+s = json.load(open(p))
+s.setdefault('container', {})['deployed'] = True
+json.dump(s, open(p, 'w'), ensure_ascii=False, indent=2)
+" 2>/dev/null || true
+        echo "[fn-wg-web] 升级：wireguard 容器仍在运行，无需重新部署"
+    else
+        python3 -c "
+import json
+p = '$STATE_FILE'
+s = json.load(open(p))
+s.setdefault('container', {})['deployed'] = False
+json.dump(s, open(p, 'w'), ensure_ascii=False, indent=2)
+" 2>/dev/null || true
+    fi
+fi
+exit 0

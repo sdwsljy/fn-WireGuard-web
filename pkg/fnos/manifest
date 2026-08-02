@@ -1,0 +1,17 @@
+appname         = fn-wg-web
+version         = 0.2.9
+display_name    = WireGuard 管理器
+platform        = all
+maintainer      = 胖啥胖
+maintainer_url  = https://club.fnnas.com
+distributor     = 胖啥胖
+distributor_url = https://club.fnnas.com
+desktop_uidir   = ui
+desktop_applaunchname = fn-wg-web.Application
+service_port    = 51821
+checkport       = false
+install_type    = root
+os_min_version  = 0.9.0
+desc            = WireGuard 管理器：在飞牛 NAS 上以 Docker 容器一键部署 WireGuard 服务端，浏览器全程可视化操作，无需命令行。点击部署自动拉取镜像、创建容器并生成密钥；支持填写公网 IP/域名、自定义 UDP 端口与内网网段、配置目录映射；一键创建/批量生成客户端，二维码与配置文件即扫即用；提供分流路由、在线状态、握手时间与实时流量统计。配置存于官方持久卷，升级不丢失，数据更安心。
+source          = thirdparty
+checksum        =

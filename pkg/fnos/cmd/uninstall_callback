@@ -1,0 +1,9 @@
+#!/bin/bash
+# 卸载后处理（温和卸载）：
+set -u
+pkill -f "wg-manager.py" 2>/dev/null || true
+rm -rf /usr/fn-wg-web 2>/dev/null || true
+rm -f /etc/sysctl.d/99-fn-wg-web.conf 2>/dev/null || true
+rm -f /var/log/fn-wg-web*.log 2>/dev/null || true
+echo "[fn-wg-web] 应用已卸载（wireguard 容器与配置数据保留，VPN 服务不受影响）"
+exit 0

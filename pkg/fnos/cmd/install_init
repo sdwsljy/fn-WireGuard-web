@@ -1,0 +1,5 @@
+#!/bin/bash
+# 安装前检查
+if command -v python3 >/dev/null 2>&1; then exit 0; fi
+echo "缺少 python3，请先安装：apt-get install -y python3"
+exit 1
