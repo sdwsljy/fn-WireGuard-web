@@ -110,10 +110,11 @@ fn-wg-web/
 │       └── ICON_256.PNG
 ├── build-tools/             # 打包脚本（make-icons.py / build_fpk.py）
 ├── build.ps1                # Windows 一键打包
-└── build.sh                 # Linux / fnOS 一键打包
+├── build.sh                 # Linux / fnOS 一键打包
+└── dist/                    # 发布用 .fpk 安装包
 ```
 
-`dist/`、`build/`、`__pycache__/` 为本地生成内容，已通过 `.gitignore` 排除，不作为 GitHub 源码提交。
+`dist/` 默认只保留发布用 `.fpk` 安装包；其他临时构建内容、`build/`、`__pycache__/` 已通过 `.gitignore` 排除。
 
 ## 本地开发与打包
 
