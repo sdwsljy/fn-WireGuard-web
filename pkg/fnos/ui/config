@@ -1,0 +1,15 @@
+{
+    ".url": {
+        "fn-wg-web.Application":
+        {
+            "title": "WireGuard 管理器",
+            "desc": "WireGuard 服务端可视化管理",
+            "icon": "images/icon.png",
+            "type": "iframe",
+            "port": "51821",
+            "protocol": "http",
+            "url": "http://${host}:51821/",
+            "allUsers": true
+        }
+    }
+}
