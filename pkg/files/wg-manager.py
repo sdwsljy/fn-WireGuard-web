@@ -1191,7 +1191,7 @@ class Handler(BaseHTTPRequestHandler):
         filename = "wg-%s.conf" % safe_name
         # RFC 5987：中文文件名走 filename*（UTF-8 百分号编码），ASCII 兜底保证兼容
         quoted_ascii = filename.encode("ascii", "replace").decode("ascii")
-        quoted_ascii = re.sub(r"[^A-Za-z0-9._\-]", "_", quoted_ascii)
+        quoted_ascii = re.sub(r'[^A-Za-z0-9._\-]', "_", quoted_ascii)
         from urllib.parse import quote
         filename_utf8 = quote(filename, safe="")
         body = config.encode("utf-8")
