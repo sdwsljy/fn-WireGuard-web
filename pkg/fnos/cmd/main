@@ -1,5 +1,13 @@
 #!/bin/bash
 # fn-wg-web - WireGuard 服务端可视化管理（fnOS 应用生命周期脚本）
+# 安装后（install_type=root），工具文件位于 TRIM_APPDEST
+# （/usr/local/apps/@appcenter/fn-wg-web/target），启动时初始化到运行目录并启动 Web 管理服务。
+# WireGuard 服务端运行在 linuxserver/wireguard 容器中（应用界面一键部署）。
+# 目录策略（与 fnOS 官方 fpk 标准一致）：
+#   程序文件目录  /usr/fn-wg-web            （web 静态资源，WG_WEB_BASE）
+#   数据目录      /var/apps/fn-wg-web/var   （state.json 配置，WG_DATA_BASE，
+#                                            → /usr/local/apps/@appdata/fn-wg-web，升级/卸载保留）
+#   旧版本数据在 /usr/fn-wg-web，首次启动自动迁移到持久卷。
 DEST_DIR="/usr/fn-wg-web"
 PERSIST_DIR="/var/apps/fn-wg-web/var"
 DATA_DIR="$PERSIST_DIR"
@@ -7,18 +15,23 @@ SVC_PORT="${TRIM_SERVICE_PORT:-51821}"
 
 case $1 in
 start)
+    # 1. 初始化程序文件（幂等）
     mkdir -p "$DEST_DIR" "$PERSIST_DIR"
     if [ -d "$TRIM_APPDEST" ]; then
         cp -f "$TRIM_APPDEST"/wg-manager.py "$DEST_DIR/" 2>/dev/null || true
         cp -rf "$TRIM_APPDEST"/web "$DEST_DIR/" 2>/dev/null || true
         chmod +x "$DEST_DIR/wg-manager.py" 2>/dev/null || true
     fi
+    # 2. 旧版本数据迁移：/usr/fn-wg-web/state.json → 持久卷（只迁一次）
     if [ -f "$DEST_DIR/state.json" ] && [ ! -f "$DATA_DIR/state.json" ]; then
         cp -f "$DEST_DIR/state.json" "$DATA_DIR/state.json" 2>/dev/null || true
         echo "[fn-wg-web] 配置已迁移到官方持久卷: $DATA_DIR"
     fi
+    # 3. 启动 Web 管理服务（程序文件与数据目录分离）
     if ! pgrep -f "wg-manager.py --port ${SVC_PORT}" >/dev/null 2>&1; then
-        WG_WEB_BASE="$DEST_DIR" WG_DATA_BASE="$DATA_DIR" nohup python3 -u "$DEST_DIR/wg-manager.py" --port "$SVC_PORT" >/var/log/fn-wg-web.log 2>&1 &
+        WG_WEB_BASE="$DEST_DIR" WG_DATA_BASE="$DATA_DIR" \
+            nohup python3 -u "$DEST_DIR/wg-manager.py" --port "$SVC_PORT" \
+            >/var/log/fn-wg-web.log 2>&1 &
         sleep 1
     fi
     exit 0
@@ -28,7 +41,11 @@ stop)
     exit 0
     ;;
 status)
-    if pgrep -f "wg-manager.py --port ${SVC_PORT}" >/dev/null 2>&1; then exit 0; else exit 3; fi
+    if pgrep -f "wg-manager.py --port ${SVC_PORT}" >/dev/null 2>&1; then
+        exit 0
+    else
+        exit 3
+    fi
     ;;
 *)
     exit 1

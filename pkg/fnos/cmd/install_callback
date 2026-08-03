@@ -1,12 +1,17 @@
 #!/bin/bash
 # 安装完成处理（升级/覆盖安装同样执行本脚本）：
+# 1) 配置从官方持久卷读取（/var/apps/fn-wg-web/var，升级/覆盖安装自动保留）
+# 2) 按容器实况设置 deployed：容器仍在 → 已部署，无需重新部署
+# 3) 校验桌面图标注册所需文件
 set -u
+
 APP_NAME="fn-wg-web"
 TARGET="${TRIM_APPDEST:-/usr/local/apps/@appcenter/fn-wg-web}"
 UI_LINK="/var/apps_ui/${APP_NAME}"
 DEST="/usr/fn-wg-web"
 DATA_DIR="/var/apps/fn-wg-web/var"
 
+# 1. 配置落位到持久卷（cmd/main start 时会以持久卷为数据目录启动）
 mkdir -p "$DATA_DIR"
 if [ -f "$DATA_DIR/state.json" ]; then
     echo "[fn-wg-web] 配置已在官方持久卷（升级/覆盖安装保留），直接使用"
@@ -17,6 +22,7 @@ else
     echo "[fn-wg-web] 全新安装，无历史配置"
 fi
 
+# 2. 按容器实况设置 deployed（容器仍在 → 已部署，无需重新部署）
 if [ -f "$DATA_DIR/state.json" ]; then
     if docker inspect wireguard >/dev/null 2>&1; then
         python3 -c "
@@ -38,9 +44,11 @@ json.dump(s, open(p, 'w'), ensure_ascii=False, indent=2)
     fi
 fi
 
+# 3. 校验桌面图标注册文件
 OK=1
 if [ ! -f "$TARGET/ui/config" ]; then
-    echo "[fn-wg-web] 错误: target/ui/config 不存在，桌面图标将无法注册"; OK=0
+    echo "[fn-wg-web] 错误: target/ui/config 不存在，桌面图标将无法注册"
+    OK=0
 else
     echo "[fn-wg-web] ui/config 就位，图标定义正常"
 fi
@@ -51,6 +59,8 @@ if [ -L "$UI_LINK" ]; then
     echo "[fn-wg-web] 桌面图标链接已建立: $UI_LINK -> $(readlink "$UI_LINK")"
 else
     echo "[fn-wg-web] 警告: 桌面图标链接 $UI_LINK 不存在"
+    echo "[fn-wg-web] 若应用中心未自动注册，请重启应用中心服务刷新桌面: systemctl restart trim_app_center.service"
 fi
+
 [ "$OK" -eq 1 ] && echo "[fn-wg-web] 安装完成，桌面图标注册文件齐全"
 exit 0

@@ -1,9 +1,18 @@
 #!/bin/bash
 # 卸载后处理（温和卸载）：
+#   - 不再删除 wireguard 容器与配置映射目录：卸载应用不影响已部署的 VPN 服务，
+#     容器继续运行，客户端配置继续有效。
+#   - 应用内提供「卸载并删除全部数据」按钮，由用户主动决定是否彻底清理。
+#   - 本脚本只做：停止管理服务、清理应用自身运行目录与日志。
 set -u
+
+# 1. 停止管理服务
 pkill -f "wg-manager.py" 2>/dev/null || true
+
+# 2. 清理应用自身运行目录与日志（wireguard 容器与映射目录保留）
 rm -rf /usr/fn-wg-web 2>/dev/null || true
 rm -f /etc/sysctl.d/99-fn-wg-web.conf 2>/dev/null || true
 rm -f /var/log/fn-wg-web*.log 2>/dev/null || true
-echo "[fn-wg-web] 应用已卸载（wireguard 容器与配置数据保留，VPN 服务不受影响）"
+
+echo "[fn-wg-web] 应用已卸载（wireguard 容器与配置数据保留，VPN 服务不受影响；如需彻底清理请重新安装后在应用内点击「卸载并删除全部数据」）"
 exit 0
