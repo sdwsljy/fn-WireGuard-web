@@ -2,7 +2,7 @@
 """fn-wg-web fpk 打包器（纯标准库，Windows/Linux 通用）
 
 生成 fnOS 可安装的 .fpk 应用包：
-  fn-wg-web_0.2.9_all.fpk (tar.gz)
+  fn-wg-web_0.2.0_all.fpk (tar.gz)
   ├── manifest / ICON.PNG / ICON_256.PNG
   ├── app.tgz   (wg-manager.py + web/)
   ├── cmd/      (main + *_init + *_callback)
@@ -73,6 +73,8 @@ def main():
     os.makedirs(stage)
 
     # 1. app.tgz（wg-manager.py + web/ + ui/）
+    #    ui/ 冗余打进 app.tgz：确保安装后 target/ui 一定存在，
+    #    应用中心据此读取 ui/config 注册桌面图标。
     app_tgz = os.path.join(stage, "app.tgz")
     with open(app_tgz, "wb") as raw:
         with gzip.GzipFile(fileobj=raw, mode="wb", mtime=0) as gz:
@@ -88,7 +90,10 @@ def main():
 
     # 3. 打包 fpk
     out_fpk = os.path.join(DIST_DIR, PKG)
-    members = ["manifest", "app.tgz", "cmd", "config", "ICON.PNG", "ICON_256.PNG", "ui"]
+    members = [
+        "manifest", "app.tgz", "cmd", "config",
+        "ICON.PNG", "ICON_256.PNG", "ui",
+    ]
     with open(out_fpk, "wb") as raw:
         with gzip.GzipFile(fileobj=raw, mode="wb", mtime=0) as gz:
             with tarfile.open(fileobj=gz, mode="w") as tf:
