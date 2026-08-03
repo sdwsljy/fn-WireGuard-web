@@ -1,5 +1,5 @@
 #!/bin/bash
-# 卸载前检查
+# 卸载前检查：若存在在线客户端将提示
 if [ -f /usr/fn-wg-web/state.json ]; then
     count=$(python3 -c "import json;print(len(json.load(open('/usr/fn-wg-web/state.json')).get('peers',[])))" 2>/dev/null)
     if [ -n "$count" ] && [ "$count" -gt 0 ] 2>/dev/null; then

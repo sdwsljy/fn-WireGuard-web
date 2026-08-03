@@ -1,21 +1,30 @@
 #!/bin/bash
-# 升级后处理：
+# 升级后处理（应用中心"升级"流程执行本脚本，不触发卸载清理）：
+#  1) 刷新程序文件到运行目录
+#  2) 配置在官方持久卷自动保留，无需备份恢复
+#  3) 按容器实况修正 deployed：容器仍在 → 已部署，无需重新部署
 set -u
+
 APP_NAME="fn-wg-web"
 DEST="/usr/fn-wg-web"
 DATA_DIR="/var/apps/fn-wg-web/var"
 STATE_FILE="$DATA_DIR/state.json"
 
+# 1. 刷新程序文件（TRIM_APPDEST 为新版本 target）
 if [ -d "$TRIM_APPDEST" ] && [ -d "$DEST" ]; then
     cp -f "$TRIM_APPDEST"/wg-manager.py "$DEST/" 2>/dev/null || true
     cp -rf "$TRIM_APPDEST"/web "$DEST/" 2>/dev/null || true
     chmod +x "$DEST/wg-manager.py" 2>/dev/null || true
 fi
+
+# 2. 配置兼容：旧运行目录配置迁移到持久卷（升级场景兜底）
 mkdir -p "$DATA_DIR"
 if [ ! -f "$STATE_FILE" ] && [ -f "$DEST/state.json" ]; then
     cp -f "$DEST/state.json" "$STATE_FILE" 2>/dev/null || true
     echo "[fn-wg-web] 升级：已迁移旧配置到持久卷"
 fi
+
+# 3. 按容器实况修正 deployed（容器保留时保持已部署，无需重新部署）
 if [ -f "$STATE_FILE" ]; then
     if docker inspect wireguard >/dev/null 2>&1; then
         python3 -c "
@@ -36,4 +45,5 @@ json.dump(s, open(p, 'w'), ensure_ascii=False, indent=2)
 " 2>/dev/null || true
     fi
 fi
+
 exit 0
