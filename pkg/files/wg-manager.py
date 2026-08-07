@@ -16,9 +16,11 @@ fn-wg-web - WireGuard 可视化 Web 管理服务（纯 Python 标准库实现）
   - 实时状态：容器/接口状态、各客户端最新握手时间与传输流量
 """
 import argparse
+import hashlib
 import json
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -28,7 +30,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-VERSION = "0.2.9"
+VERSION = "0.3.0"
 
 # 状态文件写入锁（并发请求下防止 tmp 文件竞争）
 _state_lock = threading.Lock()
@@ -217,6 +219,7 @@ DEFAULT_STATE = {
         "subnet": DEFAULT_SUBNET,
         "dns": DEFAULT_DNS,
         "keepalive": DEFAULT_KEEPALIVE,
+        "mtu": 1280,
         "nat": True,
         "wan_iface": "auto",
     },
@@ -229,6 +232,12 @@ DEFAULT_STATE = {
         "name": CONTAINER_NAME,
         "config_dir": "",
         "deployed": False,
+    },
+    "auth": {
+        "enabled": False,
+        "password_hash": "",
+        "salt": "",
+        "session_token": "",
     },
 }
 
@@ -259,6 +268,46 @@ def save_state(state):
 
 def is_initialized(state):
     return bool(state.get("server_private_key"))
+
+
+# ---------------------------------------------------------------------------
+# 密码认证
+# ---------------------------------------------------------------------------
+
+def hash_password(password, salt=None):
+    """SHA-256 加盐哈希密码。"""
+    if salt is None:
+        salt = secrets.token_hex(16)
+    h = hashlib.sha256((salt + password).encode("utf-8")).hexdigest()
+    return h, salt
+
+
+def verify_password(password, stored_hash, salt):
+    """校验密码。"""
+    h, _ = hash_password(password, salt)
+    return secrets.compare_digest(h, stored_hash)
+
+
+def auth_enabled(state):
+    """是否启用了密码认证。"""
+    a = state.get("auth", {})
+    return bool(a.get("enabled") and a.get("password_hash"))
+
+
+def check_auth(handler):
+    """检查请求是否已认证（Cookie 中的 session_token）。未启用认证时返回 True。"""
+    state = load_state()
+    if not auth_enabled(state):
+        return True
+    token = ""
+    cookie_header = handler.headers.get("Cookie", "")
+    for part in cookie_header.split(";"):
+        part = part.strip()
+        if part.startswith("wg_token="):
+            token = part[len("wg_token="):]
+            break
+    expected = state.get("auth", {}).get("session_token", "")
+    return bool(token) and bool(expected) and secrets.compare_digest(token, expected)
 
 
 # ---------------------------------------------------------------------------
@@ -293,11 +342,13 @@ def build_wg0_conf(state):
         wan = "eth0"
     else:
         wan = detect_wan_iface()
+    mtu = int(s.get("mtu") or 1280)
     lines = []
     lines.append("[Interface]")
     lines.append("PrivateKey = %s" % state["server_private_key"])
     lines.append("Address = %s" % server_ip)
     lines.append("ListenPort = %d" % int(s["port"]))
+    lines.append("MTU = %d" % mtu)
     if s.get("nat", True):
         lines.append("PostUp = iptables -t nat -A POSTROUTING -s %s -o %s -j MASQUERADE" % (s["subnet"], wan))
         lines.append("PostUp = iptables -A FORWARD -i wg0 -j ACCEPT")
@@ -306,6 +357,8 @@ def build_wg0_conf(state):
         lines.append("PostDown = iptables -D FORWARD -i wg0 -j ACCEPT")
         lines.append("PostDown = iptables -D FORWARD -o wg0 -j ACCEPT")
     for peer in state["peers"]:
+        if not peer.get("enabled", True):
+            continue  # 已停用的客户端不写入配置
         lines.append("")
         lines.append("[Peer]")
         lines.append("# %s" % peer["name"])
@@ -578,6 +631,9 @@ def build_client_config(state, peer):
     lines.append("[Interface]")
     lines.append("PrivateKey = %s" % peer["private_key"])
     lines.append("Address = %s/%s" % (peer["ip"], ipaddress_ip_network(s["subnet"]).prefixlen))
+    mtu = int(s.get("mtu") or 1280)
+    if mtu > 0:
+        lines.append("MTU = %d" % mtu)
     dns = (s.get("dns") or "").strip()
     if dns:
         lines.append("DNS = %s" % dns)
@@ -611,6 +667,7 @@ def create_peer(state, name, route=None):
         "private_key": priv,
         "ip": ip,
         "created_at": int(time.time()),
+        "enabled": True,
         "route": route or {"mode": "full", "cidr": ""},
     }
     state["peers"].append(peer)
@@ -648,6 +705,39 @@ def delete_peer(state, peer_id):
     if not peer:
         raise ValueError("客户端不存在")
     state["peers"] = [p for p in state["peers"] if p["id"] != peer_id]
+    save_state(state)
+    ok, msg = apply_config(state)
+    if ok:
+        state["config_dirty"] = False
+        save_state(state)
+    return peer, ok, msg
+
+
+def rename_peer(state, peer_id, new_name):
+    """重命名客户端（仅修改名称，不涉及密钥/IP，无需重启容器）。"""
+    new_name = (new_name or "").strip()
+    if not new_name:
+        raise ValueError("客户端名称不能为空")
+    if len(new_name) > 32:
+        raise ValueError("客户端名称过长（最多 32 字符）")
+    peer = next((p for p in state["peers"] if p["id"] == peer_id), None)
+    if not peer:
+        raise ValueError("客户端不存在")
+    for p in state["peers"]:
+        if p["id"] != peer_id and p["name"] == new_name:
+            raise ValueError("客户端名称已存在")
+    old_name = peer["name"]
+    peer["name"] = new_name
+    save_state(state)
+    return peer, old_name
+
+
+def toggle_peer(state, peer_id):
+    """切换客户端启用/停用状态（停用的客户端从 wg0.conf 中移除，重启容器生效）。"""
+    peer = next((p for p in state["peers"] if p["id"] == peer_id), None)
+    if not peer:
+        raise ValueError("客户端不存在")
+    peer["enabled"] = not peer.get("enabled", True)
     save_state(state)
     ok, msg = apply_config(state)
     if ok:
@@ -741,6 +831,7 @@ def collect_peers_status(state):
             "ip": p["ip"],
             "public_key": p["public_key"],
             "created_at": p["created_at"],
+            "enabled": p.get("enabled", True),
             "route": p.get("route") or {"mode": "full", "cidr": ""},
             "endpoint": live.get("endpoint", ""),
             "handshake": handshake,
@@ -759,11 +850,14 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "fn-wg-web/" + VERSION
 
     # ---- 辅助 ----
-    def _json(self, obj, code=200):
+    def _json(self, obj, code=200, headers=None):
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        if headers:
+            for k, v in headers.items():
+                self.send_header(k, v)
         self.end_headers()
         self.wfile.write(body)
 
@@ -784,16 +878,9 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/") or "/"
 
-        if path == "/api/status":
-            return self.api_status()
-        if path == "/api/peers":
-            return self.api_peers_list()
-        m = re.match(r"^/api/peers/([0-9a-f]+)/config$", path)
-        if m:
-            return self.api_peer_config(m.group(1))
-        m = re.match(r"^/api/peers/([0-9a-f]+)$", path)
-        if m:
-            return self.api_peer_get(m.group(1))
+        # 无需认证的路由
+        if path == "/api/auth/status":
+            return self.api_auth_status()
         if path == "/" or path == "/index.html" or path == "/index.cgi":
             return self.serve_file("index.html", "text/html; charset=utf-8")
         if path == "/favicon.ico":
@@ -806,12 +893,47 @@ class Handler(BaseHTTPRequestHandler):
             return self.serve_file("app.js", "application/javascript; charset=utf-8")
         if path == "/qrcode.min.js":
             return self.serve_file("qrcode.min.js", "application/javascript; charset=utf-8")
+
+        # 以下路由需要认证
+        if not check_auth(self):
+            self._json({"ok": False, "error": "未登录", "need_auth": True}, 401)
+            return
+
+        if path == "/api/status":
+            return self.api_status()
+        if path == "/api/peers":
+            return self.api_peers_list()
+        if path == "/api/config/export":
+            return self.api_config_export()
+        m = re.match(r"^/api/peers/([0-9a-f]+)/config$", path)
+        if m:
+            return self.api_peer_config(m.group(1))
+        m = re.match(r"^/api/peers/([0-9a-f]+)$", path)
+        if m:
+            return self.api_peer_get(m.group(1))
         # 兜底：图标/未知路径统一返回管理首页（避免 iframe 显示 JSON 404）
         return self.serve_file("index.html", "text/html; charset=utf-8")
 
     def do_POST(self):
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/")
+
+        # 无需认证的路由
+        if path == "/api/auth/setup":
+            return self.api_auth_setup()
+        if path == "/api/auth/login":
+            return self.api_auth_login()
+        if path == "/api/auth/logout":
+            return self.api_auth_logout()
+
+        # 以下路由需要认证
+        if not check_auth(self):
+            self._json({"ok": False, "error": "未登录", "need_auth": True}, 401)
+            return
+
+        if path == "/api/auth/disable":
+            return self.api_auth_disable()
+
         if path == "/api/init":
             return self.api_init()
         if path == "/api/settings":
@@ -832,11 +954,29 @@ class Handler(BaseHTTPRequestHandler):
             return self.api_container_restart()
         if path == "/api/reset":
             return self.api_reset()
+        if path == "/api/config/import":
+            return self.api_config_import()
+        if path == "/api/peers/toggle":
+            return self.api_peer_toggle()
+        self._json({"ok": False, "error": "not found"}, 404)
+
+    def do_PUT(self):
+        parsed = urlparse(self.path)
+        path = parsed.path.rstrip("/")
+        if not check_auth(self):
+            self._json({"ok": False, "error": "未登录", "need_auth": True}, 401)
+            return
+        m = re.match(r"^/api/peers/([0-9a-f]+)$", path)
+        if m:
+            return self.api_peer_rename(m.group(1))
         self._json({"ok": False, "error": "not found"}, 404)
 
     def do_DELETE(self):
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/")
+        if not check_auth(self):
+            self._json({"ok": False, "error": "未登录", "need_auth": True}, 401)
+            return
         m = re.match(r"^/api/peers/([0-9a-f]+)$", path)
         if m:
             return self.api_peer_delete(m.group(1))
@@ -856,6 +996,78 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
+
+    # ---- 认证 ----
+    def api_auth_status(self):
+        state = load_state()
+        a = state.get("auth", {})
+        enabled = auth_enabled(state)
+        authed = check_auth(self) if enabled else True
+        self._json({
+            "ok": True,
+            "auth_enabled": enabled,
+            "authed": authed,
+            "need_setup": not a.get("password_hash"),
+        })
+
+    def api_auth_setup(self):
+        body = self._read_body()
+        password = (body.get("password") or "").strip()
+        if len(password) < 4:
+            self._bad("密码长度至少 4 位")
+            return
+        state = load_state()
+        a = state.setdefault("auth", {})
+        if a.get("password_hash"):
+            # 已设置过密码，需要先登录
+            if not check_auth(self):
+                self._json({"ok": False, "error": "请先登录后再修改密码"}, 401)
+                return
+        pwd_hash, salt = hash_password(password)
+        a["password_hash"] = pwd_hash
+        a["salt"] = salt
+        a["enabled"] = True
+        token = secrets.token_hex(32)
+        a["session_token"] = token
+        save_state(state)
+        log("密码认证已启用")
+        self._json({"ok": True, "message": "密码已设置，认证已启用"},
+                    headers={"Set-Cookie": "wg_token=%s; Path=/; HttpOnly; SameSite=Strict" % token})
+
+    def api_auth_login(self):
+        body = self._read_body()
+        password = (body.get("password") or "").strip()
+        state = load_state()
+        a = state.get("auth", {})
+        if not auth_enabled(state):
+            self._json({"ok": True, "message": "认证未启用", "authed": True})
+            return
+        if not verify_password(password, a.get("password_hash", ""), a.get("salt", "")):
+            self._json({"ok": False, "error": "密码错误"}, 401)
+            return
+        token = secrets.token_hex(32)
+        a["session_token"] = token
+        save_state(state)
+        log("用户登录成功")
+        self._json({"ok": True, "message": "登录成功"},
+                    headers={"Set-Cookie": "wg_token=%s; Path=/; HttpOnly; SameSite=Strict" % token})
+
+    def api_auth_logout(self):
+        state = load_state()
+        state.setdefault("auth", {})["session_token"] = ""
+        save_state(state)
+        self._json({"ok": True, "message": "已退出登录"},
+                    headers={"Set-Cookie": "wg_token=; Path=/; Max-Age=0"})
+
+    def api_auth_disable(self):
+        """关闭密码认证（需要先登录）。"""
+        state = load_state()
+        a = state.setdefault("auth", {})
+        a["enabled"] = False
+        a["session_token"] = ""
+        save_state(state)
+        log("密码认证已关闭")
+        self._json({"ok": True, "message": "密码认证已关闭"})
 
     # ---- 状态 ----
     def api_status(self):
@@ -879,6 +1091,7 @@ class Handler(BaseHTTPRequestHandler):
             "initialized": initialized,
             "interface_up": online,
             "config_dirty": bool(state.get("config_dirty")),
+            "auth_enabled": auth_enabled(state),
             "settings": s,
             "server_ip": state.get("server_ip", ""),
             "server_public_key": state.get("server_public_key", ""),
@@ -899,8 +1112,11 @@ class Handler(BaseHTTPRequestHandler):
         port = int(body.get("port") or DEFAULT_PORT)
         subnet = (body.get("subnet") or "").strip()
         endpoint = (body.get("endpoint") or "").strip()
+        mtu = int(body.get("mtu") or 1280)
         if not (1 <= port <= 65535):
             errors.append("端口必须在 1-65535 之间")
+        if not (576 <= mtu <= 9000):
+            errors.append("MTU 必须在 576-9000 之间")
         try:
             import ipaddress
             net = ipaddress.ip_network(subnet, strict=False)
@@ -917,7 +1133,7 @@ class Handler(BaseHTTPRequestHandler):
             ) or re.match(r"^\d{1,3}(\.\d{1,3}){3}$", endpoint)
             if not valid_host:
                 errors.append("公网 IP/域名格式不正确")
-        return errors, port, subnet, endpoint
+        return errors, port, subnet, endpoint, mtu
 
     # ---- 初始化 / 设置 / 应用 ----
     def api_init(self):
@@ -926,7 +1142,7 @@ class Handler(BaseHTTPRequestHandler):
         if is_initialized(state):
             self._bad("服务器已初始化，如需修改请使用「应用设置」，或先重置服务器")
             return
-        errors, port, subnet, endpoint = self._validate_settings(body)
+        errors, port, subnet, endpoint, mtu = self._validate_settings(body)
         if errors:
             self._bad("；".join(errors))
             return
@@ -935,6 +1151,7 @@ class Handler(BaseHTTPRequestHandler):
         state["settings"]["endpoint"] = endpoint
         state["settings"]["dns"] = (body.get("dns") or DEFAULT_DNS).strip()
         state["settings"]["keepalive"] = int(body.get("keepalive") or DEFAULT_KEEPALIVE)
+        state["settings"]["mtu"] = mtu
         state["settings"]["nat"] = bool(body.get("nat", True))
         try:
             state["server_private_key"] = gen_key()
@@ -980,7 +1197,7 @@ class Handler(BaseHTTPRequestHandler):
         if not is_initialized(state):
             self._bad("请先完成服务器初始化")
             return
-        errors, port, subnet, endpoint = self._validate_settings(body)
+        errors, port, subnet, endpoint, mtu = self._validate_settings(body)
         if errors:
             self._bad("；".join(errors))
             return
@@ -990,11 +1207,13 @@ class Handler(BaseHTTPRequestHandler):
             return
         old_port = state["settings"]["port"]
         old_endpoint = state["settings"]["endpoint"]
+        old_mtu = state["settings"].get("mtu", 1280)
         state["settings"]["port"] = port
         state["settings"]["subnet"] = subnet
         state["settings"]["endpoint"] = endpoint
         state["settings"]["dns"] = (body.get("dns") or DEFAULT_DNS).strip()
         state["settings"]["keepalive"] = int(body.get("keepalive") or DEFAULT_KEEPALIVE)
+        state["settings"]["mtu"] = mtu
         state["settings"]["nat"] = bool(body.get("nat", True))
         net = ipaddress_ip_network(subnet)
         state["server_ip"] = str(net.network_address + 1)
@@ -1005,7 +1224,7 @@ class Handler(BaseHTTPRequestHandler):
                         p["ip"] = str(net.network_address + 1)
                 except Exception:
                     pass
-        changed = (port != old_port) or (endpoint != old_endpoint) or subnet_changed
+        changed = (port != old_port) or (endpoint != old_endpoint) or subnet_changed or (mtu != old_mtu)
         if changed:
             state["config_dirty"] = True
         save_state(state)
@@ -1022,7 +1241,7 @@ class Handler(BaseHTTPRequestHandler):
         state = load_state()
         # 保存/合并设置
         try:
-            errors, port, subnet, endpoint = self._validate_settings(body)
+            errors, port, subnet, endpoint, mtu = self._validate_settings(body)
         except Exception:
             errors = ["参数不完整"]
         if errors:
@@ -1033,6 +1252,7 @@ class Handler(BaseHTTPRequestHandler):
         state["settings"]["endpoint"] = endpoint
         state["settings"]["dns"] = (body.get("dns") or DEFAULT_DNS).strip()
         state["settings"]["keepalive"] = int(body.get("keepalive") or DEFAULT_KEEPALIVE)
+        state["settings"]["mtu"] = mtu
         state["settings"]["nat"] = bool(body.get("nat", True))
         save_state(state)
         config_dir = body.get("config_dir") or DEFAULT_CONFIG_DIR
@@ -1214,6 +1434,79 @@ class Handler(BaseHTTPRequestHandler):
             return
         log("删除客户端: %s (%s)" % (peer["name"], peer["ip"]))
         self._json({"ok": True, "message": "已删除客户端 %s" % peer["name"], "applied": ok, "apply_message": msg})
+
+    def api_peer_rename(self, peer_id):
+        body = self._read_body()
+        new_name = body.get("name") or ""
+        state = load_state()
+        try:
+            peer, old_name = rename_peer(state, peer_id, new_name)
+        except ValueError as e:
+            self._bad(str(e))
+            return
+        log("重命名客户端: %s → %s" % (old_name, peer["name"]))
+        self._json({"ok": True, "message": "已重命名为 %s" % peer["name"], "peer": peer})
+
+    def api_peer_toggle(self):
+        body = self._read_body()
+        peer_id = body.get("id") or ""
+        state = load_state()
+        try:
+            peer, ok, msg = toggle_peer(state, peer_id)
+        except ValueError as e:
+            self._bad(str(e))
+            return
+        action = "启用" if peer.get("enabled", True) else "停用"
+        log("%s客户端: %s (%s)" % (action, peer["name"], peer["ip"]))
+        self._json({"ok": True, "message": "已%s客户端 %s" % (action, peer["name"]),
+                     "enabled": peer.get("enabled", True), "applied": ok, "apply_message": msg})
+
+    def api_config_export(self):
+        """导出完整配置（state.json）为 JSON 文件下载。"""
+        state = load_state()
+        # 导出时清除会话令牌（安全考虑）
+        export = json.loads(json.dumps(state))
+        if "auth" in export:
+            export["auth"]["session_token"] = ""
+        body = json.dumps(export, ensure_ascii=False, indent=2).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Disposition", 'attachment; filename="fn-wg-web-config.json"')
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def api_config_import(self):
+        """从 JSON 导入配置（覆盖当前配置）。"""
+        body = self._read_body()
+        if not body:
+            self._bad("导入数据为空")
+            return
+        state = load_state()
+        # 保留当前认证配置（不允许通过导入覆盖密码）
+        current_auth = state.get("auth", {})
+        try:
+            # body 可能是完整的 state 对象，也可能是嵌套在 data 字段中
+            imported = body.get("data") if "data" in body else body
+            # 合并默认值
+            fresh = json.loads(json.dumps(DEFAULT_STATE))
+            for k in ("settings", "server_private_key", "server_public_key",
+                       "server_ip", "peers", "config_dirty", "container"):
+                if k in imported:
+                    fresh[k] = imported[k]
+            fresh["auth"] = current_auth
+        except Exception as e:
+            self._bad("导入数据格式错误：%s" % str(e))
+            return
+        save_state(fresh)
+        # 尝试应用到运行时
+        if is_initialized(fresh) and get_mode() != "mock":
+            ok, msg = apply_config(fresh)
+            if ok:
+                fresh["config_dirty"] = False
+                save_state(fresh)
+        log("配置已导入")
+        self._json({"ok": True, "message": "配置已导入并应用"})
 
     # ---- 日志 ----
     def log_message(self, fmt, *args):

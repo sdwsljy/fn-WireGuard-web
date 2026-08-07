@@ -7,9 +7,14 @@ const $ = (id) => document.getElementById(id);
 const state = {
   status: null,
   peers: [],
+  filteredPeers: [],
   currentPeer: null,   // 详情弹窗中的客户端
   currentConfig: "",
   initDone: false,
+  authEnabled: false,
+  authed: false,
+  searchQuery: "",
+  renamePeerId: null,
 };
 
 /* ---------------- 工具 ---------------- */
@@ -32,6 +37,10 @@ async function api(path, opts) {
     headers: { "Content-Type": "application/json" },
     ...opts,
   });
+  if (res.status === 401) {
+    showLogin("login");
+    throw new Error("请先登录");
+  }
   const data = await res.json().catch(() => ({}));
   if (!res.ok || data.ok === false) {
     throw new Error(data.error || ("请求失败 HTTP " + res.status));
@@ -43,6 +52,148 @@ function esc(s) {
   return String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({
     "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
   }[c]));
+}
+
+/* ---------------- 认证 ---------------- */
+
+async function checkAuthStatus() {
+  try {
+    const res = await api("/api/auth/status");
+    state.authEnabled = res.auth_enabled;
+    state.authed = res.authed;
+    if (res.auth_enabled && !res.authed) {
+      showLogin("login");
+      return false;
+    }
+    if (!res.auth_enabled && res.need_setup) {
+      // 首次使用，不强制设置密码
+    }
+    updateAuthUI();
+    return true;
+  } catch (e) {
+    // 如果是 401 导致的 showLogin，不再重复
+    return false;
+  }
+}
+
+function showLogin(mode) {
+  const modal = $("loginModal");
+  const title = $("loginTitle");
+  const label = $("loginLabel");
+  const confirmField = $("loginConfirmField");
+  const pwd = $("loginPassword");
+  const confirm = $("loginConfirm");
+  pwd.value = "";
+  confirm.value = "";
+  if (mode === "setup") {
+    title.textContent = "设置管理密码";
+    label.textContent = "设置密码";
+    confirmField.classList.remove("hidden");
+    pwd.placeholder = "设置管理密码（至少 4 位）";
+  } else {
+    title.textContent = "登录";
+    label.textContent = "密码";
+    confirmField.classList.add("hidden");
+    pwd.placeholder = "请输入管理密码";
+  }
+  modal.hidden = false;
+  modal.dataset.mode = mode;
+  setTimeout(() => pwd.focus(), 60);
+}
+
+async function doLogin() {
+  const modal = $("loginModal");
+  const mode = modal.dataset.mode || "login";
+  const password = $("loginPassword").value;
+  const btn = $("loginConfirmBtn");
+  if (!password) {
+    toast("请输入密码", "err");
+    return;
+  }
+  if (mode === "setup") {
+    const confirm = $("loginConfirm").value;
+    if (password !== confirm) {
+      toast("两次输入的密码不一致", "err");
+      return;
+    }
+    if (password.length < 4) {
+      toast("密码长度至少 4 位", "err");
+      return;
+    }
+  }
+  btn.disabled = true;
+  try {
+    const url = mode === "setup" ? "/api/auth/setup" : "/api/auth/login";
+    const res = await api(url, {
+      method: "POST",
+      body: JSON.stringify({ password }),
+    });
+    modal.hidden = true;
+    state.authed = true;
+    state.authEnabled = true;
+    toast(res.message, "ok");
+    updateAuthUI();
+    await loadStatus();
+    await loadPeers();
+  } catch (e) {
+    toast(e.message, "err");
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function doLogout() {
+  try {
+    await api("/api/auth/logout", { method: "POST" });
+    state.authed = false;
+    toast("已退出登录", "ok");
+    showLogin("login");
+    updateAuthUI();
+  } catch (e) {
+    toast(e.message, "err");
+  }
+}
+
+async function disableAuth() {
+  if (!confirm("确定关闭密码认证？关闭后任何人可直接访问管理面板。")) return;
+  try {
+    await api("/api/auth/disable", { method: "POST" });
+    state.authEnabled = false;
+    state.authed = true;
+    toast("密码认证已关闭", "ok");
+    updateAuthUI();
+  } catch (e) {
+    toast(e.message, "err");
+  }
+}
+
+function updateAuthUI() {
+  const badge = $("authStatus").querySelector(".auth-badge");
+  const btn = $("authBtn");
+  const logoutBtn = $("logoutBtn");
+  const disableBtn = $("disableAuthBtn");
+  if (state.authEnabled) {
+    badge.textContent = "已启用";
+    badge.className = "auth-badge on";
+    btn.textContent = "修改密码";
+    logoutBtn.classList.remove("hidden");
+    disableBtn.classList.remove("hidden");
+  } else {
+    badge.textContent = "未启用";
+    badge.className = "auth-badge off";
+    btn.textContent = "设置密码";
+    logoutBtn.classList.add("hidden");
+    disableBtn.classList.add("hidden");
+  }
+}
+
+function openAuthSetup() {
+  if (state.authEnabled) {
+    // 已启用 → 修改密码（需先登录，已登录则直接设置）
+    showLogin("setup");
+  } else {
+    showLogin("setup");
+  }
 }
 
 /* ---------------- 状态徽章 ---------------- */
@@ -98,7 +249,12 @@ function renderStatus() {
   $("fSubnet").value = s.subnet || "10.13.13.0/24";
   $("fDns").value = s.dns || "";
   $("fKeepalive").value = s.keepalive || 25;
+  $("fMtu").value = s.mtu || 1280;
   $("fNat").checked = s.nat !== false;
+
+  // 认证状态
+  state.authEnabled = !!st.auth_enabled;
+  updateAuthUI();
 
   // 初始化提示 & 按钮
   const hint = $("initHint");
@@ -179,6 +335,7 @@ async function deployContainer() {
     subnet: $("dSubnet").value.trim(),
     endpoint: $("dEndpoint").value.trim(),
     dns: $("dDns").value.trim(),
+    mtu: parseInt($("dMtu").value, 10) || 1280,
     keepalive: 25,
     nat: true,
     pull: true,
@@ -237,6 +394,7 @@ async function saveSettings() {
     subnet: $("fSubnet").value.trim(),
     dns: $("fDns").value.trim(),
     keepalive: parseInt($("fKeepalive").value, 10),
+    mtu: parseInt($("fMtu").value, 10) || 1280,
     nat: $("fNat").checked,
   };
   const btn = $("saveBtn");
@@ -292,18 +450,21 @@ async function loadPeers() {
 function peerCard(p) {
   const initial = esc((p.name || "?").slice(0, 1).toUpperCase());
   const online = !!p.online;
+  const enabled = p.enabled !== false;
   const rx = esc(p.rx || "0 B");
   const tx = esc(p.tx || "0 B");
   const route = (p.route || {}).mode === "split" ? "分流" : "全量";
+  const disabledTag = enabled ? "" : '<span class="disabled-tag">已停用</span>';
   return `
-  <div class="peer-card">
-    <div class="peer-avatar ${online ? "" : "off"}">${initial}</div>
+  <div class="peer-card${enabled ? "" : " disabled"}">
+    <div class="peer-avatar ${online && enabled ? "" : "off"}">${initial}</div>
     <div class="peer-info">
       <div class="peer-name">
         <span>${esc(p.name)}</span>
         <span class="route-tag" title="客户端路由模式">${route}</span>
-        <span class="peer-state ${online ? "s-on" : "s-off"}">
-          <span class="sdot"></span>${online ? "在线" : "离线"}
+        ${disabledTag}
+        <span class="peer-state ${online && enabled ? "s-on" : "s-off"}">
+          <span class="sdot"></span>${online && enabled ? "在线" : "离线"}
         </span>
       </div>
       <div class="peer-meta">
@@ -320,6 +481,12 @@ function peerCard(p) {
       <button class="btn btn-act" data-act="dl" data-id="${p.id}" title="下载配置" aria-label="下载">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M7 10l5 5 5-5"/><path d="M12 15V3"/></svg>
       </button>
+      <button class="btn btn-act" data-act="rename" data-id="${p.id}" title="重命名" aria-label="重命名">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+      </button>
+      <button class="btn btn-act" data-act="toggle" data-id="${p.id}" title="${enabled ? "停用" : "启用"}" aria-label="${enabled ? "停用" : "启用"}">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M18.36 6.64a9 9 0 1 1-12.73 0"/><line x1="12" y1="2" x2="12" y2="12"/></svg>
+      </button>
       <button class="btn btn-act btn-del" data-act="del" data-id="${p.id}" title="删除客户端" aria-label="删除">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><path d="M10 11v6M14 11v6"/></svg>
       </button>
@@ -330,8 +497,17 @@ function peerCard(p) {
 function renderPeers() {
   const list = $("peerList");
   const empty = $("emptyBox");
-  if (!state.peers.length) {
-    $("emptyText").textContent = state.initDone ? "暂无客户端" : "尚未初始化服务器";
+  // 搜索过滤
+  const q = state.searchQuery.toLowerCase().trim();
+  state.filteredPeers = q
+    ? state.peers.filter((p) =>
+        (p.name || "").toLowerCase().includes(q) ||
+        (p.ip || "").toLowerCase().includes(q))
+    : state.peers;
+  if (!state.filteredPeers.length) {
+    $("emptyText").textContent = state.peers.length
+      ? "未找到匹配的客户端"
+      : (state.initDone ? "暂无客户端" : "尚未初始化服务器");
     empty.style.display = "";
     list.querySelectorAll(".peer-card").forEach((n) => n.remove());
     return;
@@ -339,7 +515,7 @@ function renderPeers() {
   empty.style.display = "none";
   list.querySelectorAll(".peer-card").forEach((n) => n.remove());
   const frag = document.createDocumentFragment();
-  state.peers.forEach((p) => {
+  state.filteredPeers.forEach((p) => {
     const div = document.createElement("div");
     div.innerHTML = peerCard(p).trim();
     frag.appendChild(div.firstChild);
@@ -485,6 +661,109 @@ function copyConfig() {
   }
 }
 
+/* ---------------- 重命名 / 停用 ---------------- */
+
+function openRename(peer) {
+  state.renamePeerId = peer.id;
+  $("renameInput").value = peer.name;
+  $("renameModal").hidden = false;
+  setTimeout(() => {
+    $("renameInput").focus();
+    $("renameInput").select();
+  }, 60);
+}
+
+async function confirmRename() {
+  const newName = $("renameInput").value.trim();
+  if (!newName) {
+    toast("请输入新名称", "err");
+    return;
+  }
+  const btn = $("renameConfirm");
+  btn.disabled = true;
+  try {
+    await api("/api/peers/" + state.renamePeerId, {
+      method: "PUT",
+      body: JSON.stringify({ name: newName }),
+    });
+    $("renameModal").hidden = true;
+    toast("已重命名为「" + newName + "」", "ok");
+    await loadPeers();
+  } catch (e) {
+    toast(e.message, "err");
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function togglePeer(id) {
+  const p = state.peers.find((x) => x.id === id);
+  if (!p) return;
+  const action = p.enabled !== false ? "停用" : "启用";
+  if (!confirm("确定" + action + "客户端「" + p.name + "」？")) return;
+  try {
+    await api("/api/peers/toggle", {
+      method: "POST",
+      body: JSON.stringify({ id }),
+    });
+    toast("已" + action + "客户端「" + p.name + "」", "ok");
+    await loadStatus(true);
+    await loadPeers();
+  } catch (e) {
+    toast(e.message, "err");
+  }
+}
+
+/* ---------------- 导入 / 导出 ---------------- */
+
+async function exportConfig() {
+  try {
+    const res = await fetch("/api/config/export");
+    if (!res.ok) throw new Error("导出失败");
+    const blob = await res.blob();
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "fn-wg-web-config.json";
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => {
+      URL.revokeObjectURL(a.href);
+      a.remove();
+    }, 200);
+    toast("配置已导出", "ok");
+  } catch (e) {
+    toast(e.message, "err");
+  }
+}
+
+function triggerImport() {
+  $("importFile").click();
+}
+
+async function importConfig(e) {
+  const file = e.target.files[0];
+  if (!file) return;
+  if (!confirm("导入配置将覆盖当前所有设置和客户端，确定继续？")) {
+    e.target.value = "";
+    return;
+  }
+  try {
+    const text = await file.text();
+    const data = JSON.parse(text);
+    await api("/api/config/import", {
+      method: "POST",
+      body: JSON.stringify(data),
+    });
+    toast("配置已导入并应用", "ok");
+    await loadStatus();
+    await loadPeers();
+  } catch (e) {
+    toast(e.message || "导入失败：文件格式错误", "err");
+  } finally {
+    e.target.value = "";
+  }
+}
+
 /* ---------------- 删除 / 重置 ---------------- */
 
 async function deletePeer(id) {
@@ -607,8 +886,36 @@ function bindEvents() {
           downloadConfig();
         })
         .catch(() => toast("下载失败", "err"));
-    } else if (act === "del") deletePeer(id);
+    } else if (act === "rename") openRename(p);
+    else if (act === "toggle") togglePeer(id);
+    else if (act === "del") deletePeer(id);
   });
+
+  // 搜索框
+  $("peerSearch").addEventListener("input", (e) => {
+    state.searchQuery = e.target.value;
+    renderPeers();
+  });
+
+  // 认证
+  $("authBtn").addEventListener("click", openAuthSetup);
+  $("disableAuthBtn").addEventListener("click", disableAuth);
+  $("logoutBtn").addEventListener("click", doLogout);
+  $("loginConfirmBtn").addEventListener("click", doLogin);
+  $("loginPassword").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") doLogin();
+  });
+
+  // 重命名
+  $("renameConfirm").addEventListener("click", confirmRename);
+  $("renameInput").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") confirmRename();
+  });
+
+  // 导入 / 导出
+  $("exportBtn").addEventListener("click", exportConfig);
+  $("importBtn").addEventListener("click", triggerImport);
+  $("importFile").addEventListener("change", importConfig);
 
   // 关闭弹窗
   document.querySelectorAll("[data-close]").forEach((b) => {
@@ -632,10 +939,13 @@ function bindEvents() {
 /* ---------------- 启动 ---------------- */
 
 bindEvents();
-loadStatus().then(() => {
+checkAuthStatus().then((ok) => {
+  if (ok) {
+    loadStatus();
+  }
   // 周期刷新客户端状态
   setInterval(() => {
-    if (document.visibilityState === "visible") {
+    if (document.visibilityState === "visible" && state.authed) {
       loadStatus(true).then(() => loadPeers());
     }
   }, 10000);

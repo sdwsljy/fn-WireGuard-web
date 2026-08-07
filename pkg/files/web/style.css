@@ -559,6 +559,64 @@ input:focus {
 .toast.err { border-left-color: var(--danger); }
 .toast.ok  { border-left-color: var(--ok); }
 
+/* ---------------- 搜索框 ---------------- */
+.peer-search {
+  position: relative;
+  margin-bottom: 16px;
+}
+.peer-search .search-icon {
+  position: absolute;
+  left: 12px; top: 50%;
+  transform: translateY(-50%);
+  width: 15px; height: 15px;
+  color: var(--text-faint);
+  pointer-events: none;
+}
+.peer-search input {
+  padding-left: 36px;
+}
+
+/* ---------------- 认证状态 ---------------- */
+.auth-status {
+  display: flex; align-items: center; gap: 10px;
+}
+.auth-badge {
+  font-size: 11.5px; font-weight: 550;
+  padding: 3px 10px; border-radius: 999px;
+}
+.auth-badge.on {
+  color: var(--ok);
+  background: rgba(52, 211, 153, 0.1);
+  border: 1px solid rgba(52, 211, 153, 0.28);
+}
+.auth-badge.off {
+  color: var(--text-faint);
+  background: rgba(93, 109, 136, 0.12);
+  border: 1px solid var(--border);
+}
+
+/* 小弹窗 */
+.modal-sm { max-width: 360px; }
+
+/* ---------------- 停用客户端样式 ---------------- */
+.peer-card.disabled {
+  opacity: 0.5;
+}
+.peer-card.disabled .peer-avatar {
+  background: linear-gradient(135deg, #4b5a75, #2c3a52);
+  color: #c8d3e4;
+}
+.disabled-tag {
+  font-size: 10.5px;
+  font-weight: 550;
+  color: var(--warn);
+  background: rgba(251, 191, 36, 0.1);
+  border: 1px solid rgba(251, 191, 36, 0.25);
+  padding: 1px 7px;
+  border-radius: 999px;
+  line-height: 1.5;
+}
+
 /* ---------------- 响应式 ---------------- */
 @media (max-width: 920px) {
   .layout { grid-template-columns: 1fr; }
