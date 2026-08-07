@@ -878,9 +878,20 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/") or "/"
 
-        # 无需认证的路由
+        # 无需认证的 API 路由
         if path == "/api/auth/status":
             return self.api_auth_status()
+
+        # 认证检查：启用认证且未登录时，所有请求（含静态文件、内网访问）均需认证
+        if not check_auth(self):
+            # API 请求 → 返回 401 JSON（前端 fetch 可识别）
+            if path.startswith("/api/"):
+                self._json({"ok": False, "error": "未登录", "need_auth": True}, 401)
+                return
+            # 非API请求 → 返回自包含登录页（不暴露完整应用界面）
+            return self.serve_login_page()
+
+        # 已认证 → 正常路由
         if path == "/" or path == "/index.html" or path == "/index.cgi":
             return self.serve_file("index.html", "text/html; charset=utf-8")
         if path == "/favicon.ico":
@@ -893,12 +904,6 @@ class Handler(BaseHTTPRequestHandler):
             return self.serve_file("app.js", "application/javascript; charset=utf-8")
         if path == "/qrcode.min.js":
             return self.serve_file("qrcode.min.js", "application/javascript; charset=utf-8")
-
-        # 以下路由需要认证
-        if not check_auth(self):
-            self._json({"ok": False, "error": "未登录", "need_auth": True}, 401)
-            return
-
         if path == "/api/status":
             return self.api_status()
         if path == "/api/peers":
@@ -992,6 +997,129 @@ class Handler(BaseHTTPRequestHandler):
             body = f.read()
         self.send_response(200)
         self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    # ---- 登录页（自包含，不依赖外部 CSS/JS） ----
+    def serve_login_page(self):
+        html = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>WireGuard 管理器 · 登录</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+  background:linear-gradient(135deg,#0f172a 0%,#1e293b 100%);min-height:100vh;display:flex;align-items:center;justify-content:center}
+.card{background:rgba(30,41,59,.95);border:1px solid rgba(99,102,241,.2);border-radius:16px;padding:40px 36px;width:380px;max-width:90vw;
+  box-shadow:0 20px 60px rgba(0,0,0,.4)}
+.logo{display:flex;align-items:center;gap:12px;margin-bottom:28px}
+.logo svg{width:36px;height:36px;color:#818cf8;flex-shrink:0}
+.logo h1{font-size:20px;color:#e2e8f0;font-weight:600}
+.logo p{font-size:12px;color:#94a3b8;margin-top:2px}
+.field{margin-bottom:20px}
+.field label{display:block;font-size:13px;color:#cbd5e1;margin-bottom:6px}
+.field input{width:100%;padding:12px 14px;border:1px solid rgba(148,163,184,.2);border-radius:8px;
+  background:rgba(15,23,42,.6);color:#e2e8f0;font-size:15px;outline:none;transition:border .2s}
+.field input:focus{border-color:#818cf8}
+.field input::placeholder{color:#64748b}
+.btn{width:100%;padding:13px;border:none;border-radius:8px;font-size:15px;font-weight:600;cursor:pointer;transition:all .2s}
+.btn-primary{background:linear-gradient(135deg,#6366f1,#818cf8);color:#fff}
+.btn-primary:hover{opacity:.9;transform:translateY(-1px)}
+.btn-primary:disabled{opacity:.5;cursor:not-allowed;transform:none}
+.error{color:#f87171;font-size:13px;margin-top:12px;min-height:18px}
+.hint{color:#64748b;font-size:12px;margin-top:16px;text-align:center}
+.hidden{display:none}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="logo">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M12 3v6"/><circle cx="12" cy="12" r="3"/><path d="M12 15v6"/>
+      <path d="M5.6 5.6l4.2 4.2"/><path d="M18.4 5.6l-4.2 4.2"/><path d="M5.6 18.4l4.2-4.2"/><path d="M18.4 18.4l-4.2-4.2"/>
+    </svg>
+    <div>
+      <h1>WireGuard 管理器</h1>
+      <p>fnOS 可视化 VPN 管理</p>
+    </div>
+  </div>
+  <div id="setupField" class="field hidden">
+    <label for="confirmPwd">确认密码</label>
+    <input id="confirmPwd" type="password" placeholder="再次输入密码" autocomplete="new-password">
+  </div>
+  <div class="field">
+    <label id="pwdLabel" for="pwd">密码</label>
+    <input id="pwd" type="password" placeholder="请输入管理密码" autocomplete="current-password">
+  </div>
+  <button id="loginBtn" class="btn btn-primary" onclick="doSubmit()">登录</button>
+  <p id="errMsg" class="error"></p>
+  <p class="hint">所有网络访问（含内网）均需密码认证</p>
+</div>
+<script>
+var needSetup=false;
+var mode="login";
+fetch("/api/auth/status").then(function(r){return r.json()}).then(function(d){
+  if(!d.auth_enabled){
+    location.reload();
+    return;
+  }
+  if(d.need_setup&&!d.authed){
+    needSetup=true;
+    mode="setup";
+    document.getElementById("pwdLabel").textContent="设置密码";
+    document.getElementById("pwd").placeholder="设置管理密码（至少 4 位）";
+    document.getElementById("pwd").autocomplete="new-password";
+    document.getElementById("setupField").classList.remove("hidden");
+    document.getElementById("loginBtn").textContent="设置密码并登录";
+  }
+}).catch(function(){});
+document.getElementById("pwd").addEventListener("keydown",function(e){
+  if(e.key==="Enter")doSubmit();
+});
+document.getElementById("confirmPwd").addEventListener("keydown",function(e){
+  if(e.key==="Enter")doSubmit();
+});
+function doSubmit(){
+  var pwd=document.getElementById("pwd").value;
+  var err=document.getElementById("errMsg");
+  err.textContent="";
+  if(!pwd){err.textContent="请输入密码";return;}
+  if(mode==="setup"){
+    var confirm=document.getElementById("confirmPwd").value;
+    if(pwd!==confirm){err.textContent="两次输入的密码不一致";return;}
+    if(pwd.length<4){err.textContent="密码长度至少 4 位";return;}
+  }
+  var btn=document.getElementById("loginBtn");
+  btn.disabled=true;
+  btn.textContent="请稍候...";
+  var url=mode==="setup"?"/api/auth/setup":"/api/auth/login";
+  fetch(url,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({password:pwd})})
+    .then(function(r){return r.json()})
+    .then(function(d){
+      if(d.ok){
+        location.reload();
+      }else{
+        err.textContent=d.error||"操作失败";
+        btn.disabled=false;
+        btn.textContent=mode==="setup"?"设置密码并登录":"登录";
+      }
+    })
+    .catch(function(){
+      err.textContent="网络错误，请重试";
+      btn.disabled=false;
+      btn.textContent=mode==="setup"?"设置密码并登录":"登录";
+    });
+}
+</script>
+</body>
+</html>"""
+        body = html.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
