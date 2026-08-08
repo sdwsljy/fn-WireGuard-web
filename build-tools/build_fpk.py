@@ -19,7 +19,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FILES_DIR = os.path.join(ROOT, "pkg", "files")
 FNOS_DIR = os.path.join(ROOT, "pkg", "fnos")
 DIST_DIR = os.path.join(ROOT, "dist")
-VERSION = "0.3.1"
+VERSION = "0.3.2"
 APPNAME = "fn-wg-web"
 PKG = "%s_%s_all.fpk" % (APPNAME, VERSION)
 

@@ -2,6 +2,12 @@
 
 所有重要变更记录在此文件。格式参照 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.3.2] - 2026-08-08
+
+### 修复
+
+- 修复首次使用时登录页无法显示：`/api/auth/status` 在未设置密码时返回 `auth_enabled: true`，登录页 JS 优先检查 `need_setup` 再检查 `auth_enabled`，避免无限刷新导致白屏
+
 ## [0.3.1] - 2026-08-08
 
 ### 变更
