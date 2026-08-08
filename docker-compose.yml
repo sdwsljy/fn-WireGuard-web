@@ -1,0 +1,29 @@
+# fn-wg-web - WireGuard 管理器（Docker 版）
+#
+# 用法：
+#   docker compose up -d --build
+#   浏览器访问 http://<主机IP>:51821
+#
+# 说明：
+#   - 挂载 /var/run/docker.sock：管理面板在宿主机上创建/管理 wireguard 容器
+#     （wireguard 容器的 UDP 端口映射到宿主机，映射目录由面板内自行填写）
+#   - fn-wg-web-data：管理面板自身配置（state.json）持久化
+#   - 可选环境变量：WG_CONTAINER_NAME / WG_CONTAINER_IMAGE
+#     （自定义 wireguard 容器名/镜像，默认 wireguard / linuxserver/wireguard:latest）
+
+services:
+  fn-wg-web:
+    build: .
+    image: fn-wg-web:0.3.3
+    container_name: fn-wg-web
+    restart: unless-stopped
+    ports:
+      - "51821:51821"                    # 管理面板 Web UI
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock   # 管理宿主 wireguard 容器
+      - fn-wg-web-data:/var/apps/fn-wg-web/var      # 面板配置持久化
+    environment:
+      - TZ=Asia/Shanghai
+
+volumes:
+  fn-wg-web-data:

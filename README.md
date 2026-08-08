@@ -1,8 +1,8 @@
 # WireGuard 管理器（fn-wg-web）
 
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.3.0-green.svg)](#)
-[![Platform](https://img.shields.io/badge/platform-fnOS%20x86_64%20%7C%20arm64-orange.svg)](#)
+[![Version](https://img.shields.io/badge/version-0.3.3-green.svg)](#)
+[![Platform](https://img.shields.io/badge/platform-fnOS%20x86_64%20%7C%20arm64%20%7C%20Docker-orange.svg)](#)
 [![Docker](https://img.shields.io/badge/docker-linuxserver%2Fwireguard-lightgrey.svg)](#)
 
 在飞牛 OS（fnOS）上以 Docker 容器方式部署 WireGuard 服务端的可视化 Web 管理面板。安装即用，浏览器全程操作，无需命令行：点击部署自动拉取 `linuxserver/wireguard:latest` 镜像并创建容器，可视化完成服务器配置、客户端创建与状态监控。
@@ -37,6 +37,36 @@
 4. 填写配置目录映射等参数，点击「部署 WireGuard 容器」（首次自动拉取镜像，约 1-2 分钟）
 
 外部浏览器访问：`http://NAS_IP:51821`
+
+## Docker 部署（任意 Linux 主机）
+
+除 fnOS 应用中心外，本项目提供通用 Docker 版：管理容器通过挂载宿主机 `docker.sock` 在宿主机上创建/管理 wireguard 容器（与 fnOS 版同架构），任意装有 Docker 的 Linux 主机（fnOS、群晖、威联通、PVE、云主机等）均可部署。WireGuard 配置读写通过 `docker exec` 进入 wireguard 容器完成，无需在 compose 中挂载配置映射目录。
+
+```bash
+git clone https://github.com/sdwsljy/fn-WireGuard-web.git
+cd fn-WireGuard-web
+docker compose up -d --build
+```
+
+浏览器访问 `http://主机IP:51821`，首次打开设置管理密码，然后在面板内填写 UDP 端口、内网网段、公网 IP/域名与配置目录映射，点击「部署 WireGuard 容器」即可（wireguard 容器的 UDP 端口映射到宿主机）。
+
+常用命令：
+
+```bash
+docker compose logs -f      # 查看日志
+docker compose restart      # 重启管理服务
+docker compose down         # 停止并移除管理容器（wireguard 容器与数据保留）
+```
+
+可选环境变量（compose 中 `environment` 覆盖）：
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `WG_CONTAINER_NAME` | `wireguard` | wireguard 容器名 |
+| `WG_CONTAINER_IMAGE` | `linuxserver/wireguard:latest` | wireguard 镜像 |
+| `TZ` | `Asia/Shanghai` | 时区 |
+
+> 提示：面板自身配置存于命名卷 `fn-wg-web-data`（`/var/apps/fn-wg-web/var/state.json`），`docker compose down` 不删除卷；彻底清理可执行 `docker compose down -v`。
 
 ## 使用指南
 
@@ -106,6 +136,9 @@ fn-wg-web/
 ├── LICENSE                   # MIT 协议
 ├── CHANGELOG.md              # 版本变更记录
 ├── .gitignore                # Git 忽略规则
+├── Dockerfile                # Docker 版镜像（python:3.12-alpine + docker-cli）
+├── docker-compose.yml        # Docker 版一键部署（挂载 docker.sock + 数据卷）
+├── .dockerignore             # Docker 构建忽略项
 ├── pkg/
 │   ├── files/               # 运行时文件
 │   │   ├── wg-manager.py    # 管理服务（REST API + 容器编排）
@@ -160,7 +193,7 @@ WG_WEB_BASE=/tmp/wgm-test python3 pkg/files/wg-manager.py --port 51821
 
 ## 安全说明
 
-管理面板支持密码认证（v0.3.0+），在「安全与备份」区块设置管理密码后，所有 API 请求需携带会话令牌。建议在内网之外访问时开启。未启用密码认证时，请仅在受信任的内网环境使用。WireGuard 使用 UDP 协议，请确保防火墙放行监听端口。首次部署需要 NAS 能够访问 Docker Hub（网络异常时可在 Docker 设置中配置镜像加速）。
+管理面板支持密码认证（v0.3.0+），在「安全与备份」区块设置管理密码后，所有网络访问（含内网）均需输入密码登录，API 请求需携带会话令牌。建议始终开启密码认证。未启用密码认证时，管理面板无鉴权，存在安全风险。WireGuard 使用 UDP 协议，请确保防火墙放行监听端口。首次部署需要 NAS 能够访问 Docker Hub（网络异常时可在 Docker 设置中配置镜像加速）。
 
 ## License
 
