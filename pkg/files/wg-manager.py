@@ -30,7 +30,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-VERSION = "0.3.3"
+VERSION = "0.3.2"
 
 # 状态文件写入锁（并发请求下防止 tmp 文件竞争）
 _state_lock = threading.Lock()
@@ -375,32 +375,14 @@ def build_wg0_conf(state):
 
 
 def write_conf(state):
-    """写入 wg0.conf；写入前校验服务器私钥合法，防止 MOCK/非法密钥破坏容器。
-
-    容器模式：通过 `docker exec` 写入容器内 /config/wg_confs/wg0.conf，
-    不依赖宿主机映射路径（Docker 部署版也能正常工作）。
-    """
+    """写入 wg0.conf；写入前校验服务器私钥合法，防止 MOCK/非法密钥破坏容器。"""
     priv = state.get("server_private_key") or ""
     if get_mode() != "mock" and not is_valid_key(priv):
         raise RuntimeError("服务器私钥无效或缺失，无法写入配置。请重置服务器后重新初始化")
-    content = build_wg0_conf(state)
-    if get_mode() == "container":
-        if not container_running():
-            ok, _, err = run_cmd(["docker", "start", CONTAINER_NAME], timeout=30)
-            if not ok:
-                raise RuntimeError("容器未运行，无法写入配置：%s" % (err or "启动失败"))
-            time.sleep(3)
-        ok, out, err = run_cmd(
-            ["docker", "exec", "-i", CONTAINER_NAME, "sh", "-c",
-             "cat > /config/wg_confs/wg0.conf"],
-            timeout=15, input_data=content)
-        if not ok:
-            raise RuntimeError("写入 wg0.conf 失败：%s" % (err or out))
-        return "/config/wg_confs/wg0.conf"
     path = conf_path(state)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
-        f.write(content)
+        f.write(build_wg0_conf(state))
     return path
 
 
@@ -513,7 +495,7 @@ def build_docker_cmd(state, config_dir):
 
 
 def read_conf_private_key(path):
-    """从 wg0.conf 解析 PrivateKey；容器模式下本地读取失败时回退 docker exec。"""
+    """从 wg0.conf 解析 PrivateKey。"""
     try:
         with open(path, "r", encoding="utf-8") as f:
             for line in f:
@@ -522,15 +504,6 @@ def read_conf_private_key(path):
                     return line.split("=", 1)[1].strip()
     except Exception:
         pass
-    if get_mode() == "container":
-        ok, out, _ = run_cmd(
-            ["docker", "exec", CONTAINER_NAME, "cat", "/config/wg_confs/wg0.conf"],
-            timeout=10)
-        if ok and out:
-            for line in out.splitlines():
-                line = line.strip()
-                if line.startswith("PrivateKey"):
-                    return line.split("=", 1)[1].strip()
     return ""
 
 
@@ -547,11 +520,8 @@ def deploy_container(state, config_dir, pull=True):
         raise RuntimeError("容器 %s 已存在，如需重新部署请先移除" % CONTAINER_NAME)
 
     # ---- 第一步：部署 Docker 容器（不涉及密钥） ----
-    # 1. 创建配置目录（容器挂载需要；Docker 部署版无法访问宿主机路径时由 docker 自动创建）
-    try:
-        os.makedirs(os.path.join(config_dir, "wg_confs"), exist_ok=True)
-    except OSError:
-        pass
+    # 1. 创建配置目录（容器挂载需要，仅建目录不写配置）
+    os.makedirs(os.path.join(config_dir, "wg_confs"), exist_ok=True)
     state["container"]["config_dir"] = config_dir
     state["container"]["deployed"] = False
     save_state(state)

@@ -2,18 +2,6 @@
 
 所有重要变更记录在此文件。格式参照 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [0.3.3] - 2026-08-08
-
-### 新增
-
-- Docker 版部署：新增 `Dockerfile` + `docker-compose.yml`，管理容器通过挂载宿主机 docker.sock 创建/管理 wireguard 容器，任意装有 Docker 的 Linux 主机（含 fnOS、群晖、威联通、PVE、云主机等）均可一键 `docker compose up -d --build` 部署
-- 容器模式下 wg0.conf 读写改为通过 `docker exec` 进入 wireguard 容器完成，Docker 部署版无需在 compose 中挂载宿主机映射目录
-
-### 变更
-
-- `write_conf` / `read_conf_private_key` 容器模式支持 docker exec 读写（fnOS 版行为不变）
-- 部署容器时配置映射目录由 docker 自动创建（宿主机路径不可访问时不再报错）
-
 ## [0.3.2] - 2026-08-08
 
 ### 修复

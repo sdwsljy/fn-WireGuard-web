@@ -1,5 +1,5 @@
 appname         = fn-wg-web
-version         = 0.3.3
+version         = 0.3.2
 display_name    = WireGuard 管理器
 platform        = all
 maintainer      = 胖啥胖
