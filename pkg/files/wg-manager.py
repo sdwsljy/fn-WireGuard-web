@@ -30,7 +30,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-VERSION = "0.3.0"
+VERSION = "0.3.2"
 
 # 状态文件写入锁（并发请求下防止 tmp 文件竞争）
 _state_lock = threading.Lock()
@@ -295,10 +295,16 @@ def auth_enabled(state):
 
 
 def check_auth(handler):
-    """检查请求是否已认证（Cookie 中的 session_token）。未启用认证时返回 True。"""
+    """检查请求是否已认证。未设置密码时返回 False（强制设置密码）；已设置但未启用认证时返回 True。"""
     state = load_state()
-    if not auth_enabled(state):
+    a = state.get("auth", {})
+    # 未设置密码 → 强制进入设置流程
+    if not a.get("password_hash"):
+        return False
+    # 已设置密码但未启用认证 → 允许访问
+    if not a.get("enabled"):
         return True
+    # 认证已启用 → 校验会话令牌
     token = ""
     cookie_header = handler.headers.get("Cookie", "")
     for part in cookie_header.split(";"):
@@ -306,7 +312,7 @@ def check_auth(handler):
         if part.startswith("wg_token="):
             token = part[len("wg_token="):]
             break
-    expected = state.get("auth", {}).get("session_token", "")
+    expected = a.get("session_token", "")
     return bool(token) and bool(expected) and secrets.compare_digest(token, expected)
 
 
@@ -1063,10 +1069,6 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica N
 var needSetup=false;
 var mode="login";
 fetch("/api/auth/status").then(function(r){return r.json()}).then(function(d){
-  if(!d.auth_enabled){
-    location.reload();
-    return;
-  }
   if(d.need_setup&&!d.authed){
     needSetup=true;
     mode="setup";
@@ -1075,6 +1077,9 @@ fetch("/api/auth/status").then(function(r){return r.json()}).then(function(d){
     document.getElementById("pwd").autocomplete="new-password";
     document.getElementById("setupField").classList.remove("hidden");
     document.getElementById("loginBtn").textContent="设置密码并登录";
+  }else if(!d.auth_enabled){
+    location.reload();
+    return;
   }
 }).catch(function(){});
 document.getElementById("pwd").addEventListener("keydown",function(e){
@@ -1129,13 +1134,23 @@ function doSubmit(){
     def api_auth_status(self):
         state = load_state()
         a = state.get("auth", {})
+        has_password = bool(a.get("password_hash"))
         enabled = auth_enabled(state)
+        # 未设置密码 → 需要设置（强制设置页）；auth_enabled 返回 True 以触发登录页显示设置表单
+        if not has_password:
+            self._json({
+                "ok": True,
+                "auth_enabled": True,
+                "authed": False,
+                "need_setup": True,
+            })
+            return
         authed = check_auth(self) if enabled else True
         self._json({
             "ok": True,
             "auth_enabled": enabled,
             "authed": authed,
-            "need_setup": not a.get("password_hash"),
+            "need_setup": False,
         })
 
     def api_auth_setup(self):
