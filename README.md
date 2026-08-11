@@ -1,7 +1,7 @@
 # WireGuard 管理器（fn-wg-web）
 
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.3.2-green.svg)](#)
+[![Version](https://img.shields.io/badge/version-0.3.3-green.svg)](#)
 [![Platform](https://img.shields.io/badge/platform-fnOS%20x86_64%20%7C%20arm64-orange.svg)](#)
 [![Docker](https://img.shields.io/badge/docker-linuxserver%2Fwireguard-lightgrey.svg)](#)
 
@@ -31,7 +31,7 @@
 
 系统要求：fnOS（Debian 12，x86_64 / arm64）、已启用 Docker、root 权限安装；公网接入需要公网 IP 或 DDNS 域名，并在路由器转发对应 UDP 端口。
 
-1. 下载 `dist/fn-wg-web_0.3.0_all.fpk`
+1. 下载 `dist/fn-wg-web_0.3.3_all.fpk`
 2. 登录飞牛 NAS 桌面 → 应用中心 → 左下角「手动安装」→ 选择 fpk 上传安装
 3. 桌面出现「WireGuard 管理器」图标，打开应用
 4. 填写配置目录映射等参数，点击「部署 WireGuard 容器」（首次自动拉取镜像，约 1-2 分钟）

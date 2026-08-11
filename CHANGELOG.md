@@ -2,6 +2,16 @@
 
 所有重要变更记录在此文件。格式参照 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.3.3] - 2026-08-11
+
+### 修复
+
+- **批量创建客户端忽略「分流」路由**：`/api/peers/batch` 未解析 `route_mode`/`route_cidr`，`batch_create_peers` 也未透传 `route`，导致批量生成的客户端固定为「全量代理」，UI 选择「分流」无效；现在批量创建与单创建同样按用户选择写入 `AllowedIPs`
+- **批量创建逐个重启容器 → 一次性应用**：原实现每生成一个客户端即 `apply_config` 触发 `docker restart wireguard`，50 个客户端会重启 50 次导致已连客户端全部瞬断；重构为内存统一分配密钥/IP，仅在最后一次性写入 `wg0.conf` 并重启容器
+- **配置导入未报告应用失败**：`/api/config/import` 即便 `apply_config` 失败仍返回「配置已导入并应用」；现区分为成功（已应用到运行时）与失败（已导入但需要手动「应用到运行时」重试），前端可据此给出准确提示
+- **部署容错**：`deploy_container` 中宿主配置目录创建失败时直接抛错；现容忍 `os.makedirs` 失败（docker 挂载会自动创建目标目录），配合后续 docker run 落地主机路径
+- **`INTERNAL_SUBNET` 缺前缀长度**：传给 `linuxserver/wireguard` 镜像的环境变量为 `10.13.13.0`（缺 `/24`），与镜像模板预期不符；现传入完整 CIDR（如 `10.13.13.0/24`）
+
 ## [0.3.2] - 2026-08-08
 
 ### 修复

@@ -30,7 +30,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-VERSION = "0.3.2"
+VERSION = "0.3.3"
 
 # 状态文件写入锁（并发请求下防止 tmp 文件竞争）
 _state_lock = threading.Lock()
@@ -462,7 +462,8 @@ def build_docker_cmd(state, config_dir):
     """构建 docker run 命令。"""
     s = state["settings"]
     subnet = ipaddress_ip_network(s["subnet"])
-    internal_subnet = str(subnet.network_address)
+    # linuxserver/wireguard 镜像 INTERNAL_SUBNET 预期完整 CIDR（如 10.13.13.0/24）
+    internal_subnet = str(subnet)
     endpoint = (s.get("endpoint") or "").strip() or "auto"
     dns = (s.get("dns") or "").strip() or "auto"
     keepalive = int(s.get("keepalive") or DEFAULT_KEEPALIVE)
@@ -521,7 +522,11 @@ def deploy_container(state, config_dir, pull=True):
 
     # ---- 第一步：部署 Docker 容器（不涉及密钥） ----
     # 1. 创建配置目录（容器挂载需要，仅建目录不写配置）
-    os.makedirs(os.path.join(config_dir, "wg_confs"), exist_ok=True)
+    #    容忍创建失败：宿主机路径不可达/无权限时，docker 挂载会自动创建
+    try:
+        os.makedirs(os.path.join(config_dir, "wg_confs"), exist_ok=True)
+    except OSError as e:
+        log("配置目录创建由 docker 接管（%s）：%s" % (config_dir, e))
     state["container"]["config_dir"] = config_dir
     state["container"]["deployed"] = False
     save_state(state)
@@ -653,17 +658,25 @@ def build_client_config(state, peer):
     return "\n".join(lines)
 
 
-def create_peer(state, name, route=None):
+def _alloc_peer(state, name, route=None):
+    """内部辅助：在内存中分配一个客户端（不写盘、不应用）。
+
+    供单次与批量创建共用：避免批量创建时每个客户端都触发一次容器重启。
+    返回 (peer, error)，name 重复等校验失败时 peer 为 None 且 error 非空。
+    """
     name = (name or "").strip()
     if not name:
-        raise ValueError("客户端名称不能为空")
+        return None, "客户端名称不能为空"
     if len(name) > 32:
-        raise ValueError("客户端名称过长（最多 32 字符）")
+        return None, "客户端名称过长（最多 32 字符）"
     for p in state["peers"]:
         if p["name"] == name:
-            raise ValueError("客户端名称已存在")
-    priv = gen_key()
-    pub = derive_pub(priv)
+            return None, "客户端名称已存在"
+    try:
+        priv = gen_key()
+        pub = derive_pub(priv)
+    except RuntimeError as e:
+        return None, str(e)
     net = ipaddress_ip_network(state["settings"]["subnet"])
     ip = next_client_ip(net, state["peers"])
     peer = {
@@ -676,6 +689,14 @@ def create_peer(state, name, route=None):
         "enabled": True,
         "route": route or {"mode": "full", "cidr": ""},
     }
+    return peer, None
+
+
+def create_peer(state, name, route=None):
+    """创建单个客户端并立即应用（容器重启生效）。"""
+    peer, err = _alloc_peer(state, name, route)
+    if err:
+        raise ValueError(err)
     state["peers"].append(peer)
     save_state(state)
     ok, msg = apply_config(state)
@@ -685,8 +706,8 @@ def create_peer(state, name, route=None):
     return peer, ok, msg
 
 
-def batch_create_peers(state, count, name_prefix):
-    """批量生成客户端；创建后同步应用到运行时。"""
+def batch_create_peers(state, count, name_prefix, route=None):
+    """批量生成客户端；一次性写入配置并应用，避免逐个重启容器。"""
     count = int(count or 1)
     if count < 1 or count > 50:
         raise ValueError("批量数量必须在 1-50 之间")
@@ -696,13 +717,21 @@ def batch_create_peers(state, count, name_prefix):
     created = []
     for i in range(count):
         name = "%s-%02d" % (name_prefix, i + 1)
-        try:
-            peer, ok, msg = create_peer(state, name)
-        except ValueError as e:
+        peer, err = _alloc_peer(state, name, route)
+        if err:
             if created:
                 break
-            raise e
+            raise ValueError(err)
+        state["peers"].append(peer)
         created.append(peer)
+    if created:
+        save_state(state)
+        # 批量创建仅在最后统一应用一次，避免逐个 docker restart
+        ok, msg = apply_config(state)
+        if ok:
+            state["config_dirty"] = False
+            save_state(state)
+        log("批量创建 %d 个客户端并应用：%s" % (len(created), "成功" if ok else msg))
     return created
 
 
@@ -1518,7 +1547,8 @@ function doSubmit(){
         count = body.get("count") or 1
         name_prefix = body.get("name_prefix") or ""
         try:
-            created = batch_create_peers(state, count, name_prefix)
+            route = self._parse_route(body)
+            created = batch_create_peers(state, count, name_prefix, route)
         except ValueError as e:
             self._bad(str(e))
             return
@@ -1643,13 +1673,25 @@ function doSubmit(){
             return
         save_state(fresh)
         # 尝试应用到运行时
+        applied = True
+        apply_msg = ""
         if is_initialized(fresh) and get_mode() != "mock":
             ok, msg = apply_config(fresh)
+            applied = ok
+            apply_msg = msg
             if ok:
                 fresh["config_dirty"] = False
                 save_state(fresh)
-        log("配置已导入")
-        self._json({"ok": True, "message": "配置已导入并应用"})
+        log("配置已导入（应用 %s）" % ("成功" if applied else "失败：" + apply_msg))
+        if applied:
+            self._json({"ok": True, "message": "配置已导入并应用到运行时"})
+        else:
+            self._json({
+                "ok": True,
+                "message": "配置已导入，但应用到运行时失败（可稍后点击「应用到运行时」重试）：%s" % apply_msg,
+                "apply_failed": True,
+                "apply_message": apply_msg,
+            })
 
     # ---- 日志 ----
     def log_message(self, fmt, *args):
