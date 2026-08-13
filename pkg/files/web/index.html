@@ -162,6 +162,13 @@
       </div>
     </div>
 
+    <!-- Bug 11：出口网卡设置（原生模式生效，容器固定 eth0） -->
+    <div class="field" id="wanIfaceField">
+      <label for="fWanIface">出口网卡（NAT）</label>
+      <input id="fWanIface" type="text" spellcheck="false" value="auto" placeholder="auto">
+      <p class="hint">原生模式下 NAT 转发使用的出口网卡，留空或填 auto 自动探测。</p>
+    </div>
+
     <div class="field check-field">
       <label class="switch-label" for="fNat">
         <span>NAT 转发</span>
@@ -339,6 +346,11 @@
       <button class="modal-close" data-close aria-label="关闭">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>
       </button>
+    </div>
+    <!-- Bug 6：修改密码时显示旧密码字段 -->
+    <div class="field hidden" id="loginOldField">
+      <label for="loginOld">当前密码</label>
+      <input id="loginOld" type="password" placeholder="输入当前管理密码" autocomplete="off">
     </div>
     <div class="field">
       <label for="loginPassword" id="loginLabel">密码</label>

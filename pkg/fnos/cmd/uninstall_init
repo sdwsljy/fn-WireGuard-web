@@ -1,7 +1,14 @@
 #!/bin/bash
 # 卸载前检查：若存在在线客户端将提示
-if [ -f /usr/fn-wg-web/state.json ]; then
-    count=$(python3 -c "import json;print(len(json.load(open('/usr/fn-wg-web/state.json')).get('peers',[])))" 2>/dev/null)
+# Bug 7：按优先级依次检查官方持久卷与旧运行目录
+STATE_FILE=""
+if [ -f /var/apps/fn-wg-web/var/state.json ]; then
+    STATE_FILE="/var/apps/fn-wg-web/var/state.json"
+elif [ -f /usr/fn-wg-web/state.json ]; then
+    STATE_FILE="/usr/fn-wg-web/state.json"
+fi
+if [ -n "$STATE_FILE" ]; then
+    count=$(python3 -c "import json;print(len(json.load(open('$STATE_FILE')).get('peers',[])))" 2>/dev/null)
     if [ -n "$count" ] && [ "$count" -gt 0 ] 2>/dev/null; then
         echo "当前有 ${count} 个 WireGuard 客户端，卸载后这些客户端将全部失效！"
     fi

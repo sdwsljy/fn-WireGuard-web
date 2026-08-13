@@ -15,6 +15,7 @@ const state = {
   authed: false,
   searchQuery: "",
   renamePeerId: null,
+  csrfToken: "",  // Bug 1：CSRF token，登录后由后端返回
 };
 
 /* ---------------- 工具 ---------------- */
@@ -32,19 +33,52 @@ function toast(msg, type) {
   }, 3200);
 }
 
+function getCsrfToken() {
+  // 优先内存，其次 localStorage（多页签/刷新后保留）
+  if (state.csrfToken) return state.csrfToken;
+  try {
+    const v = localStorage.getItem("wg_csrf");
+    if (v) {
+      state.csrfToken = v;
+      return v;
+    }
+  } catch (e) { /* localStorage 不可用 */ }
+  return "";
+}
+
+function setCsrfToken(token) {
+  state.csrfToken = token || "";
+  try {
+    if (token) localStorage.setItem("wg_csrf", token);
+    else localStorage.removeItem("wg_csrf");
+  } catch (e) { /* ignore */ }
+}
+
 async function api(path, opts) {
-  const res = await fetch(path, {
-    headers: { "Content-Type": "application/json" },
-    ...opts,
-  });
+  const headers = { "Content-Type": "application/json" };
+  // Bug 1：所有非 GET 请求自动携带 CSRF token
+  const method = (opts && opts.method) || "GET";
+  if (["POST", "PUT", "DELETE", "PATCH"].includes(method.toUpperCase())) {
+    const csrf = getCsrfToken();
+    if (csrf) headers["X-CSRF-Token"] = csrf;
+  }
+  const res = await fetch(path, { headers, ...opts });
   if (res.status === 401) {
     showLogin("login");
     throw new Error("请先登录");
+  }
+  if (res.status === 403) {
+    // CSRF 校验失败 → 清空 token 让用户重新登录
+    setCsrfToken("");
+    showLogin("login");
+    throw new Error("会话已过期，请重新登录");
   }
   const data = await res.json().catch(() => ({}));
   if (!res.ok || data.ok === false) {
     throw new Error(data.error || ("请求失败 HTTP " + res.status));
   }
+  // 登录/设置密码成功后保存返回的 CSRF token
+  if (data.csrf_token) setCsrfToken(data.csrf_token);
   return data;
 }
 
@@ -61,12 +95,14 @@ async function checkAuthStatus() {
     const res = await api("/api/auth/status");
     state.authEnabled = res.auth_enabled;
     state.authed = res.authed;
+    // Bug 12：need_setup 优先于 login 判断，否则首次使用误跳登录表单
+    if (res.need_setup && !res.authed) {
+      showLogin("setup");
+      return false;
+    }
     if (res.auth_enabled && !res.authed) {
       showLogin("login");
       return false;
-    }
-    if (!res.auth_enabled && res.need_setup) {
-      // 首次使用，不强制设置密码
     }
     updateAuthUI();
     return true;
@@ -81,19 +117,28 @@ function showLogin(mode) {
   const title = $("loginTitle");
   const label = $("loginLabel");
   const confirmField = $("loginConfirmField");
+  const oldPwdField = $("loginOldField");
   const pwd = $("loginPassword");
   const confirm = $("loginConfirm");
   pwd.value = "";
   confirm.value = "";
+  if (oldPwdField) oldPwdField.querySelector("input").value = "";
   if (mode === "setup") {
-    title.textContent = "设置管理密码";
-    label.textContent = "设置密码";
+    title.textContent = state.authEnabled ? "修改管理密码" : "设置管理密码";
+    label.textContent = state.authEnabled ? "新密码" : "设置密码";
     confirmField.classList.remove("hidden");
-    pwd.placeholder = "设置管理密码（至少 4 位）";
+    pwd.placeholder = state.authEnabled ? "输入新密码（至少 4 位）" : "设置管理密码（至少 4 位）";
+    // Bug 6：已启用密码时显示旧密码字段
+    if (state.authEnabled && oldPwdField) {
+      oldPwdField.classList.remove("hidden");
+    } else if (oldPwdField) {
+      oldPwdField.classList.add("hidden");
+    }
   } else {
     title.textContent = "登录";
     label.textContent = "密码";
     confirmField.classList.add("hidden");
+    if (oldPwdField) oldPwdField.classList.add("hidden");
     pwd.placeholder = "请输入管理密码";
   }
   modal.hidden = false;
@@ -110,6 +155,7 @@ async function doLogin() {
     toast("请输入密码", "err");
     return;
   }
+  let oldPassword = "";
   if (mode === "setup") {
     const confirm = $("loginConfirm").value;
     if (password !== confirm) {
@@ -120,13 +166,26 @@ async function doLogin() {
       toast("密码长度至少 4 位", "err");
       return;
     }
+    // Bug 6：已启用密码时必须输入旧密码
+    if (state.authEnabled) {
+      const oldInput = $("loginOld");
+      if (oldInput) {
+        oldPassword = oldInput.value.trim();
+        if (!oldPassword) {
+          toast("请输入当前密码", "err");
+          return;
+        }
+      }
+    }
   }
   btn.disabled = true;
   try {
     const url = mode === "setup" ? "/api/auth/setup" : "/api/auth/login";
+    const payload = { password };
+    if (oldPassword) payload.old_password = oldPassword;
     const res = await api(url, {
       method: "POST",
-      body: JSON.stringify({ password }),
+      body: JSON.stringify(payload),
     });
     modal.hidden = true;
     state.authed = true;
@@ -145,13 +204,14 @@ async function doLogin() {
 async function doLogout() {
   try {
     await api("/api/auth/logout", { method: "POST" });
-    state.authed = false;
-    toast("已退出登录", "ok");
-    showLogin("login");
-    updateAuthUI();
   } catch (e) {
-    toast(e.message, "err");
+    // 忽略登出失败（如 token 已过期）
   }
+  state.authed = false;
+  setCsrfToken("");  // Bug 1：清空 CSRF token
+  toast("已退出登录", "ok");
+  showLogin("login");
+  updateAuthUI();
 }
 
 async function disableAuth() {
@@ -160,6 +220,7 @@ async function disableAuth() {
     await api("/api/auth/disable", { method: "POST" });
     state.authEnabled = false;
     state.authed = true;
+    setCsrfToken("");  // 关闭认证后无需 CSRF
     toast("密码认证已关闭", "ok");
     updateAuthUI();
   } catch (e) {
@@ -251,6 +312,16 @@ function renderStatus() {
   $("fKeepalive").value = s.keepalive || 25;
   $("fMtu").value = s.mtu || 1280;
   $("fNat").checked = s.nat !== false;
+  // Bug 11：填充 wan_iface
+  if ($("fWanIface")) $("fWanIface").value = s.wan_iface || "auto";
+  // 容器模式下出口网卡固定 eth0，禁用编辑
+  if ($("fWanIface")) {
+    const isContainer = (st.mode === "container");
+    $("fWanIface").disabled = isContainer;
+    $("fWanIface").value = isContainer ? "eth0（容器固定）" : (s.wan_iface || "auto");
+    const field = $("wanIfaceField");
+    if (field) field.style.display = isContainer ? "none" : "";
+  }
 
   // 认证状态
   state.authEnabled = !!st.auth_enabled;
@@ -396,6 +467,8 @@ async function saveSettings() {
     keepalive: parseInt($("fKeepalive").value, 10),
     mtu: parseInt($("fMtu").value, 10) || 1280,
     nat: $("fNat").checked,
+    // Bug 11：发送 wan_iface 给后端
+    wan_iface: ($("fWanIface") && !$("fWanIface").disabled) ? $("fWanIface").value.trim() : "auto",
   };
   const btn = $("saveBtn");
   btn.disabled = true;

@@ -30,10 +30,28 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-VERSION = "0.3.3"
+VERSION = "0.3.4"
 
 # 状态文件写入锁（并发请求下防止 tmp 文件竞争）
 _state_lock = threading.Lock()
+
+# 登录失败计数（IP 维度速率限制，Bug 8）
+_login_failures = {}
+_LOGIN_WINDOW = 300        # 5 分钟窗口
+_LOGIN_MAX_FAILS = 5       # 窗口内最多失败次数
+_LOGIN_LOCK_SECONDS = 300  # 触发后锁定时长
+
+# 会话默认参数（Bug 3）
+SESSION_TTL = 7 * 24 * 3600   # 7 天过期
+MAX_BODY = 10 * 1024 * 1024   # 10MB 请求体上限（Bug 14）
+
+# CSRF：受保护方法（Bug 1）
+_CSRF_METHODS = ("POST", "PUT", "DELETE", "PATCH")
+
+
+class _BodyTooLarge(Exception):
+    """请求体超过 MAX_BODY 限制（Bug 14）。"""
+    pass
 
 # ---------------------------------------------------------------------------
 # 路径与环境
@@ -67,7 +85,8 @@ DEFAULT_CONFIG_DIR = "/vol1/docker/wireguard"
 def log(msg):
     line = "%s  %s" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg)
     try:
-        with open(LOG_FILE, "a", encoding="utf-8") as f:
+        # errors="replace" 防止子进程输出中混入非 UTF-8 字节导致日志丢失（Bug 15）
+        with open(LOG_FILE, "a", encoding="utf-8", errors="replace") as f:
             f.write(line + "\n")
     except Exception:
         pass
@@ -237,7 +256,8 @@ DEFAULT_STATE = {
         "enabled": False,
         "password_hash": "",
         "salt": "",
-        "session_token": "",
+        # Bug 3：多会话令牌列表，每项 {token_hash, created_at, last_used, ua}
+        "sessions": [],
     },
 }
 
@@ -252,6 +272,12 @@ def load_state():
             elif isinstance(v, dict):
                 for kk, vv in v.items():
                     data[k].setdefault(kk, vv)
+        # Bug 3 兼容旧版：清理遗留的 session_token 字段
+        a = data.get("auth", {})
+        if "session_token" in a:
+            a.pop("session_token", None)
+        if "sessions" not in a:
+            a["sessions"] = []
         return data
     except Exception:
         return json.loads(json.dumps(DEFAULT_STATE))
@@ -288,23 +314,48 @@ def verify_password(password, stored_hash, salt):
     return secrets.compare_digest(h, stored_hash)
 
 
+def hash_token(token):
+    """会话令牌的哈希存储（避免 state.json 泄露后 token 仍可用，Bug 3）。"""
+    return hashlib.sha256(b"wg-session-v1:" + token.encode("utf-8")).hexdigest()
+
+
 def auth_enabled(state):
     """是否启用了密码认证。"""
     a = state.get("auth", {})
     return bool(a.get("enabled") and a.get("password_hash"))
 
 
+def _gc_sessions(sessions, now=None):
+    """清理过期会话（Bug 3：TTL 7 天）。返回清理后的列表。"""
+    if now is None:
+        now = int(time.time())
+    kept = []
+    for s in sessions or []:
+        try:
+            created = int(s.get("created_at") or 0)
+            last_used = int(s.get("last_used") or created)
+            if now - last_used > SESSION_TTL:
+                continue  # 过期
+            if now - created > SESSION_TTL * 4:
+                continue  # 绝对寿命上限
+        except Exception:
+            continue
+        kept.append(s)
+    return kept
+
+
 def check_auth(handler):
-    """检查请求是否已认证。未设置密码时返回 False（强制设置密码）；已设置但未启用认证时返回 True。"""
+    """检查请求是否已认证。
+    - 未设置密码 → 返回 False（强制进入设置流程）
+    - 已设置密码但未启用认证 → 返回 True
+    - 认证已启用 → 校验 Cookie 中的会话令牌是否在 sessions 列表中且未过期
+    """
     state = load_state()
     a = state.get("auth", {})
-    # 未设置密码 → 强制进入设置流程
     if not a.get("password_hash"):
         return False
-    # 已设置密码但未启用认证 → 允许访问
     if not a.get("enabled"):
         return True
-    # 认证已启用 → 校验会话令牌
     token = ""
     cookie_header = handler.headers.get("Cookie", "")
     for part in cookie_header.split(";"):
@@ -312,8 +363,102 @@ def check_auth(handler):
         if part.startswith("wg_token="):
             token = part[len("wg_token="):]
             break
-    expected = a.get("session_token", "")
-    return bool(token) and bool(expected) and secrets.compare_digest(token, expected)
+    if not token:
+        return False
+    token_h = hash_token(token)
+    sessions = a.get("sessions") or []
+    now = int(time.time())
+    sessions = _gc_sessions(sessions, now)
+    matched = None
+    for s in sessions:
+        if s.get("token_hash") == token_h:
+            matched = s
+            break
+    if not matched:
+        return False
+    # 更新最后使用时间（节流写盘：每 60s 写一次即可）
+    if now - int(matched.get("last_used") or 0) > 60:
+        matched["last_used"] = now
+        try:
+            save_state(state)
+        except Exception:
+            pass
+    return True
+
+
+def check_csrf(handler):
+    """CSRF 校验（Bug 1）：
+    - GET/HEAD/OPTIONS 不校验
+    - 优先校验 X-CSRF-Token 头
+    - 兜底校验 Origin/Referer 与 Host 同源
+    返回 True 表示通过。
+    """
+    if handler.command not in _CSRF_METHODS:
+        return True
+    # 1) 优先 X-CSRF-Token 头校验（前端登录后取得，存 localStorage）
+    csrf = handler.headers.get("X-CSRF-Token", "")
+    if csrf:
+        state = load_state()
+        for s in state.get("auth", {}).get("sessions") or []:
+            if s.get("csrf_token") and secrets.compare_digest(csrf, s["csrf_token"]):
+                return True
+        return False
+    # 2) 兜底：Origin / Referer 同源
+    host = handler.headers.get("Host", "")
+    origin = handler.headers.get("Origin", "") or handler.headers.get("Referer", "")
+    if not host or not origin:
+        return False
+    try:
+        from urllib.parse import urlparse as _up
+        o = _up(origin)
+        origin_authority = o.netloc.lower()  # host:port
+        return secrets.compare_digest(origin_authority, host.lower())
+    except Exception:
+        return False
+
+
+# 登录失败速率限制（Bug 8）
+def _login_fail_key(handler):
+    try:
+        ip = handler.client_address[0]
+    except Exception:
+        ip = "unknown"
+    return ip
+
+
+def login_too_many_fails(handler):
+    """是否已触发登录锁定。"""
+    key = _login_fail_key(handler)
+    rec = _login_failures.get(key)
+    if not rec:
+        return False
+    now = time.time()
+    fails = [t for t in rec["fails"] if now - t < _LOGIN_WINDOW]
+    rec["fails"] = fails
+    if not fails:
+        _login_failures.pop(key, None)
+        return False
+    if len(fails) >= _LOGIN_MAX_FAILS:
+        if now - rec.get("locked_at", 0) < _LOGIN_LOCK_SECONDS:
+            return True
+        # 锁定过期，清零
+        _login_failures.pop(key, None)
+        return False
+    return False
+
+
+def record_login_failure(handler):
+    key = _login_fail_key(handler)
+    now = time.time()
+    rec = _login_failures.setdefault(key, {"fails": [], "locked_at": 0})
+    rec["fails"].append(now)
+    rec["fails"] = [t for t in rec["fails"] if now - t < _LOGIN_WINDOW]
+    if len(rec["fails"]) >= _LOGIN_MAX_FAILS:
+        rec["locked_at"] = now
+
+
+def clear_login_failures(handler):
+    _login_failures.pop(_login_fail_key(handler), None)
 
 
 # ---------------------------------------------------------------------------
@@ -347,7 +492,12 @@ def build_wg0_conf(state):
     if get_mode() == "container":
         wan = "eth0"
     else:
-        wan = detect_wan_iface()
+        # Bug 11：尊重用户设置的出口网卡，"auto" 时再自动探测
+        wan_cfg = (s.get("wan_iface") or "auto").strip()
+        if wan_cfg and wan_cfg != "auto":
+            wan = wan_cfg
+        else:
+            wan = detect_wan_iface()
     mtu = int(s.get("mtu") or 1280)
     lines = []
     lines.append("[Interface]")
@@ -707,7 +857,9 @@ def create_peer(state, name, route=None):
 
 
 def batch_create_peers(state, count, name_prefix, route=None):
-    """批量生成客户端；一次性写入配置并应用，避免逐个重启容器。"""
+    """批量生成客户端；一次性写入配置并应用，避免逐个重启容器。
+    返回 (created, errors)，errors 为 [(name, msg), ...] 形式的失败明细（Bug 5）。
+    """
     count = int(count or 1)
     if count < 1 or count > 50:
         raise ValueError("批量数量必须在 1-50 之间")
@@ -715,13 +867,13 @@ def batch_create_peers(state, count, name_prefix, route=None):
     if len(name_prefix) > 20:
         raise ValueError("名称前缀过长（最多 20 字符）")
     created = []
+    errors = []  # Bug 5：记录每个失败明细
     for i in range(count):
         name = "%s-%02d" % (name_prefix, i + 1)
         peer, err = _alloc_peer(state, name, route)
         if err:
-            if created:
-                break
-            raise ValueError(err)
+            errors.append((name, err))
+            continue  # 继续尝试后续，不静默 break
         state["peers"].append(peer)
         created.append(peer)
     if created:
@@ -731,8 +883,9 @@ def batch_create_peers(state, count, name_prefix, route=None):
         if ok:
             state["config_dirty"] = False
             save_state(state)
-        log("批量创建 %d 个客户端并应用：%s" % (len(created), "成功" if ok else msg))
-    return created
+        log("批量创建 %d 个客户端（失败 %d 个）并应用：%s" % (
+            len(created), len(errors), "成功" if ok else msg))
+    return created, errors
 
 
 def delete_peer(state, peer_id):
@@ -900,6 +1053,10 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length") or 0)
         if length <= 0:
             return {}
+        # Bug 14：拒绝过大的请求体，防止内存耗尽
+        if length > MAX_BODY:
+            self._json({"ok": False, "error": "请求体过大（>%d MB）" % (MAX_BODY // (1024 * 1024))}, 413)
+            raise _BodyTooLarge()  # 由 do_POST/PUT/DELETE 统一捕获
         try:
             return json.loads(self.rfile.read(length).decode("utf-8"))
         except Exception:
@@ -955,22 +1112,39 @@ class Handler(BaseHTTPRequestHandler):
         return self.serve_file("index.html", "text/html; charset=utf-8")
 
     def do_POST(self):
+        try:
+            return self._route_post()
+        except _BodyTooLarge:
+            return  # 已发送 413 响应
+
+    def _route_post(self):
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/")
 
-        # 无需认证的路由
+        # 无需认证的路由（但需 CSRF 校验，Bug 1）
         if path == "/api/auth/setup":
+            if not check_csrf(self):
+                self._json({"ok": False, "error": "CSRF 校验失败"}, 403)
+                return
             return self.api_auth_setup()
         if path == "/api/auth/login":
+            if not check_csrf(self):
+                self._json({"ok": False, "error": "CSRF 校验失败"}, 403)
+                return
             return self.api_auth_login()
-        if path == "/api/auth/logout":
-            return self.api_auth_logout()
 
         # 以下路由需要认证
         if not check_auth(self):
             self._json({"ok": False, "error": "未登录", "need_auth": True}, 401)
             return
+        # Bug 1：所有状态变更接口必须通过 CSRF 校验
+        if not check_csrf(self):
+            self._json({"ok": False, "error": "CSRF 校验失败"}, 403)
+            return
 
+        # Bug 2：logout 移到需要认证组（不再允许未认证调用 → DoS 管理员）
+        if path == "/api/auth/logout":
+            return self.api_auth_logout()
         if path == "/api/auth/disable":
             return self.api_auth_disable()
 
@@ -1001,26 +1175,38 @@ class Handler(BaseHTTPRequestHandler):
         self._json({"ok": False, "error": "not found"}, 404)
 
     def do_PUT(self):
-        parsed = urlparse(self.path)
-        path = parsed.path.rstrip("/")
-        if not check_auth(self):
-            self._json({"ok": False, "error": "未登录", "need_auth": True}, 401)
+        try:
+            parsed = urlparse(self.path)
+            path = parsed.path.rstrip("/")
+            if not check_auth(self):
+                self._json({"ok": False, "error": "未登录", "need_auth": True}, 401)
+                return
+            if not check_csrf(self):
+                self._json({"ok": False, "error": "CSRF 校验失败"}, 403)
+                return
+            m = re.match(r"^/api/peers/([0-9a-f]+)$", path)
+            if m:
+                return self.api_peer_rename(m.group(1))
+            self._json({"ok": False, "error": "not found"}, 404)
+        except _BodyTooLarge:
             return
-        m = re.match(r"^/api/peers/([0-9a-f]+)$", path)
-        if m:
-            return self.api_peer_rename(m.group(1))
-        self._json({"ok": False, "error": "not found"}, 404)
 
     def do_DELETE(self):
-        parsed = urlparse(self.path)
-        path = parsed.path.rstrip("/")
-        if not check_auth(self):
-            self._json({"ok": False, "error": "未登录", "need_auth": True}, 401)
+        try:
+            parsed = urlparse(self.path)
+            path = parsed.path.rstrip("/")
+            if not check_auth(self):
+                self._json({"ok": False, "error": "未登录", "need_auth": True}, 401)
+                return
+            if not check_csrf(self):
+                self._json({"ok": False, "error": "CSRF 校验失败"}, 403)
+                return
+            m = re.match(r"^/api/peers/([0-9a-f]+)$", path)
+            if m:
+                return self.api_peer_delete(m.group(1))
+            self._json({"ok": False, "error": "not found"}, 404)
+        except _BodyTooLarge:
             return
-        m = re.match(r"^/api/peers/([0-9a-f]+)$", path)
-        if m:
-            return self.api_peer_delete(m.group(1))
-        self._json({"ok": False, "error": "not found"}, 404)
 
     # ---- 静态文件 ----
     def serve_file(self, name, ctype):
@@ -1182,6 +1368,28 @@ function doSubmit(){
             "need_setup": False,
         })
 
+    def _issue_session(self, state, handler):
+        """创建新会话并返回 (token, csrf_token)。Bug 3：多会话列表。"""
+        token = secrets.token_hex(32)
+        csrf_token = secrets.token_hex(24)
+        now = int(time.time())
+        ua = handler.headers.get("User-Agent", "")[:200]
+        session = {
+            "token_hash": hash_token(token),
+            "csrf_token": csrf_token,
+            "created_at": now,
+            "last_used": now,
+            "ua": ua,
+        }
+        a = state.setdefault("auth", {})
+        sessions = _gc_sessions(a.get("sessions") or [])
+        sessions.append(session)
+        # 限制最大保留会话数，防止内存膨胀
+        if len(sessions) > 20:
+            sessions = sessions[-20:]
+        a["sessions"] = sessions
+        return token, csrf_token
+
     def api_auth_setup(self):
         body = self._read_body()
         password = (body.get("password") or "").strip()
@@ -1191,20 +1399,30 @@ function doSubmit(){
         state = load_state()
         a = state.setdefault("auth", {})
         if a.get("password_hash"):
-            # 已设置过密码，需要先登录
+            # 已设置过密码，需要先登录 + 校验旧密码（Bug 6）
             if not check_auth(self):
                 self._json({"ok": False, "error": "请先登录后再修改密码"}, 401)
+                return
+            old_password = (body.get("old_password") or "").strip()
+            if not old_password:
+                self._json({"ok": False, "error": "修改密码必须提供当前密码"}, 400)
+                return
+            if not verify_password(old_password, a.get("password_hash", ""), a.get("salt", "")):
+                log("修改密码失败：旧密码错误")
+                self._json({"ok": False, "error": "当前密码错误"}, 401)
                 return
         pwd_hash, salt = hash_password(password)
         a["password_hash"] = pwd_hash
         a["salt"] = salt
         a["enabled"] = True
-        token = secrets.token_hex(32)
-        a["session_token"] = token
+        token, csrf_token = self._issue_session(state, self)
         save_state(state)
-        log("密码认证已启用")
-        self._json({"ok": True, "message": "密码已设置，认证已启用"},
-                    headers={"Set-Cookie": "wg_token=%s; Path=/; HttpOnly; SameSite=Strict" % token})
+        log("密码认证已启用/修改")
+        self._json({
+            "ok": True,
+            "message": "密码已设置，认证已启用",
+            "csrf_token": csrf_token,  # Bug 1：返回 CSRF token 给前端
+        }, headers={"Set-Cookie": "wg_token=%s; Path=/; HttpOnly; SameSite=Strict" % token})
 
     def api_auth_login(self):
         body = self._read_body()
@@ -1214,29 +1432,52 @@ function doSubmit(){
         if not auth_enabled(state):
             self._json({"ok": True, "message": "认证未启用", "authed": True})
             return
+        # Bug 8：登录速率限制
+        if login_too_many_fails(self):
+            log("登录被锁定（IP=%s，失败次数过多）" % self.client_address[0])
+            self._json({"ok": False, "error": "登录失败次数过多，已临时锁定 5 分钟"}, 429)
+            return
         if not verify_password(password, a.get("password_hash", ""), a.get("salt", "")):
+            record_login_failure(self)
+            log("登录失败：密码错误（IP=%s）" % self.client_address[0])
             self._json({"ok": False, "error": "密码错误"}, 401)
             return
-        token = secrets.token_hex(32)
-        a["session_token"] = token
+        clear_login_failures(self)
+        token, csrf_token = self._issue_session(state, self)
         save_state(state)
-        log("用户登录成功")
-        self._json({"ok": True, "message": "登录成功"},
-                    headers={"Set-Cookie": "wg_token=%s; Path=/; HttpOnly; SameSite=Strict" % token})
+        log("用户登录成功（IP=%s）" % self.client_address[0])
+        self._json({
+            "ok": True,
+            "message": "登录成功",
+            "csrf_token": csrf_token,
+        }, headers={"Set-Cookie": "wg_token=%s; Path=/; HttpOnly; SameSite=Strict" % token})
 
     def api_auth_logout(self):
+        """登出当前会话（仅清除当前 token，不影响其他设备会话）。Bug 3"""
         state = load_state()
-        state.setdefault("auth", {})["session_token"] = ""
-        save_state(state)
+        a = state.get("auth", {})
+        # 从 Cookie 提取当前 token
+        token = ""
+        cookie_header = self.headers.get("Cookie", "")
+        for part in cookie_header.split(";"):
+            part = part.strip()
+            if part.startswith("wg_token="):
+                token = part[len("wg_token="):]
+                break
+        if token:
+            token_h = hash_token(token)
+            sessions = _gc_sessions(a.get("sessions") or [])
+            a["sessions"] = [s for s in sessions if s.get("token_hash") != token_h]
+            save_state(state)
         self._json({"ok": True, "message": "已退出登录"},
                     headers={"Set-Cookie": "wg_token=; Path=/; Max-Age=0"})
 
     def api_auth_disable(self):
-        """关闭密码认证（需要先登录）。"""
+        """关闭密码认证（需要先登录）。Bug 3：清空所有会话。"""
         state = load_state()
         a = state.setdefault("auth", {})
         a["enabled"] = False
-        a["session_token"] = ""
+        a["sessions"] = []  # 清空所有会话
         save_state(state)
         log("密码认证已关闭")
         self._json({"ok": True, "message": "密码认证已关闭"})
@@ -1268,7 +1509,7 @@ function doSubmit(){
             "server_ip": state.get("server_ip", ""),
             "server_public_key": state.get("server_public_key", ""),
             "peer_count": len(state["peers"]),
-            "wan_iface": detect_wan_iface(),
+            "wan_iface": s.get("wan_iface") if s.get("wan_iface") and s.get("wan_iface") != "auto" else detect_wan_iface(),  # Bug 11：优先用户配置
             "container": {
                 "name": c.get("name", CONTAINER_NAME),
                 "image": CONTAINER_IMAGE,
@@ -1299,12 +1540,19 @@ function doSubmit(){
         except Exception:
             errors.append("内网网段格式不正确，示例：10.13.13.0/24")
         if endpoint and endpoint != "auto":
+            # Bug 10：DNS 标签只允许字母数字与连字符，去除下划线
+            # 同时支持 IPv4 与 IPv6 形式的 endpoint
             valid_host = re.match(
-                r"^([a-zA-Z0-9]([a-zA-Z0-9\-_]{0,61}[a-zA-Z0-9])?\.)*[a-zA-Z0-9]([a-zA-Z0-9\-_]{0,61}[a-zA-Z0-9])?$",
+                r"^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)*[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$",
                 endpoint,
-            ) or re.match(r"^\d{1,3}(\.\d{1,3}){3}$", endpoint)
+            ) or re.match(r"^\d{1,3}(\.\d{1,3}){3}$", endpoint) or re.match(r"^\[?[0-9a-fA-F:]+\]?$", endpoint)
             if not valid_host:
                 errors.append("公网 IP/域名格式不正确")
+        # Bug 11：校验 wan_iface
+        wan_iface = (body.get("wan_iface") or "auto").strip()
+        if wan_iface and wan_iface != "auto":
+            if not re.match(r"^[a-zA-Z0-9._-]{1,15}$", wan_iface):
+                errors.append("出口网卡名称格式不正确")
         return errors, port, subnet, endpoint, mtu
 
     # ---- 初始化 / 设置 / 应用 ----
@@ -1325,6 +1573,8 @@ function doSubmit(){
         state["settings"]["keepalive"] = int(body.get("keepalive") or DEFAULT_KEEPALIVE)
         state["settings"]["mtu"] = mtu
         state["settings"]["nat"] = bool(body.get("nat", True))
+        # Bug 11：保存 wan_iface 设置
+        state["settings"]["wan_iface"] = (body.get("wan_iface") or "auto").strip() or "auto"
         try:
             state["server_private_key"] = gen_key()
             state["server_public_key"] = derive_pub(state["server_private_key"])
@@ -1375,8 +1625,27 @@ function doSubmit(){
             return
         subnet_changed = subnet != state["settings"]["subnet"]
         if subnet_changed and state["peers"]:
-            self._bad("内网网段已变更且存在客户端，请先删除全部客户端，或使用「重置服务器」重新初始化")
-            return
+            # Bug 4：网段变更后，为每个 peer 在新网段内重新分配未占用 IP（从 .2 开始）
+            # 原实现把 peer IP 改成 network_address+1（= 服务器 IP），造成 IP 冲突
+            try:
+                net_new = ipaddress_ip_network(subnet)
+                new_peers_ips = []
+                used = set()
+                used.add(int(net_new.network_address) + 1)  # 服务器占用 .1
+                for p in state["peers"]:
+                    # 找一个新网段内未占用 IP
+                    candidate = int(net_new.network_address) + 2  # 从 .2 开始
+                    while candidate in used or candidate >= int(net_new.broadcast_address):
+                        candidate += 1
+                    if candidate >= int(net_new.broadcast_address):
+                        raise RuntimeError("新网段地址不足")
+                    used.add(candidate)
+                    new_peers_ips.append(str(ipaddress_ip_address(candidate)))
+                for p, new_ip in zip(state["peers"], new_peers_ips):
+                    p["ip"] = new_ip
+            except Exception as e:
+                self._bad("网段变更后无法重新分配客户端 IP：%s，请先删除全部客户端或使用「重置服务器」" % e)
+                return
         old_port = state["settings"]["port"]
         old_endpoint = state["settings"]["endpoint"]
         old_mtu = state["settings"].get("mtu", 1280)
@@ -1387,15 +1656,10 @@ function doSubmit(){
         state["settings"]["keepalive"] = int(body.get("keepalive") or DEFAULT_KEEPALIVE)
         state["settings"]["mtu"] = mtu
         state["settings"]["nat"] = bool(body.get("nat", True))
+        # Bug 11：保存 wan_iface 设置
+        state["settings"]["wan_iface"] = (body.get("wan_iface") or "auto").strip() or "auto"
         net = ipaddress_ip_network(subnet)
         state["server_ip"] = str(net.network_address + 1)
-        if subnet_changed:
-            for p in state["peers"]:
-                try:
-                    if int(ipaddress_ip_address(p["ip"])) > int(net.broadcast_address):
-                        p["ip"] = str(net.network_address + 1)
-                except Exception:
-                    pass
         changed = (port != old_port) or (endpoint != old_endpoint) or subnet_changed or (mtu != old_mtu)
         if changed:
             state["config_dirty"] = True
@@ -1426,6 +1690,8 @@ function doSubmit(){
         state["settings"]["keepalive"] = int(body.get("keepalive") or DEFAULT_KEEPALIVE)
         state["settings"]["mtu"] = mtu
         state["settings"]["nat"] = bool(body.get("nat", True))
+        # Bug 11：保存 wan_iface 设置
+        state["settings"]["wan_iface"] = (body.get("wan_iface") or "auto").strip() or "auto"
         save_state(state)
         config_dir = body.get("config_dir") or DEFAULT_CONFIG_DIR
         pull = bool(body.get("pull", True))
@@ -1452,25 +1718,63 @@ function doSubmit(){
         # 1. 移除容器
         if container_exists():
             run_cmd(["docker", "rm", "-f", CONTAINER_NAME], timeout=60)
-        # 2. 删除配置映射目录（精确读取用户配置的路径，避免误删其他数据）
+        # 2. 删除配置映射目录（Bug 9：白名单 + 关键文件存在性校验，避免误删系统目录）
         config_dir = (state.get("container", {}).get("config_dir") or "").strip()
         removed = []
-        if config_dir and config_dir != "/" and os.path.isdir(config_dir):
-            removed.append(config_dir)
-            shutil.rmtree(config_dir, ignore_errors=True)
-        elif not config_dir and os.path.isdir(DEFAULT_CONFIG_DIR):
-            removed.append(DEFAULT_CONFIG_DIR)
-            shutil.rmtree(DEFAULT_CONFIG_DIR, ignore_errors=True)
-        # 3. 清空应用配置数据（重置为初始状态）
+        failed = []
+
+        def _safe_remove(path):
+            """仅删除属于 wireguard 配置的目录：必须含 wg_confs/wg0.conf 文件，且不在系统保护路径。"""
+            if not path or path == "/":
+                return False, "空路径或根目录"
+            # 系统保护路径绝对禁止
+            PROTECTED = ("/usr", "/var", "/etc", "/bin", "/sbin", "/boot", "/lib",
+                         "/lib64", "/dev", "/proc", "/sys", "/root", "/home",
+                         "/opt", "/srv", "/mnt", "/media", "/run", "/tmp",
+                         "/usr/local", "/var/apps", "/vol1", "/vol2", "/vol3",
+                         "/volume1", "/volume2", "/volume3")
+            norm = os.path.normpath(path)
+            for p in PROTECTED:
+                if norm == p:
+                    return False, "受保护路径，拒绝删除：%s" % p
+            # 必须存在 wg0.conf 才能确认是 wireguard 配置目录
+            conf_marker = os.path.join(norm, "wg_confs", "wg0.conf")
+            if not os.path.isfile(conf_marker):
+                return False, "未发现 wg_confs/wg0.conf，无法确认是 wireguard 配置目录"
+            try:
+                shutil.rmtree(norm)
+                return True, None
+            except Exception as e:
+                return False, str(e)
+
+        if config_dir:
+            ok_dir, err = _safe_remove(config_dir)
+            if ok_dir:
+                removed.append(config_dir)
+            else:
+                failed.append("%s: %s" % (config_dir, err))
+        elif os.path.isdir(DEFAULT_CONFIG_DIR):
+            ok_dir, err = _safe_remove(DEFAULT_CONFIG_DIR)
+            if ok_dir:
+                removed.append(DEFAULT_CONFIG_DIR)
+            else:
+                failed.append("%s: %s" % (DEFAULT_CONFIG_DIR, err))
+        # 3. 清空应用配置数据（重置为初始状态，但保留认证设置与服务器设置）
         fresh = json.loads(json.dumps(DEFAULT_STATE))
         fresh["settings"] = json.loads(json.dumps(state["settings"]))  # 保留服务器设置（端口/网段等）
+        fresh["auth"] = json.loads(json.dumps(state.get("auth", {})))  # 保留密码认证
         fresh["container"]["deployed"] = False
         save_state(fresh)
-        log("一键卸载完成：容器已移除，配置目录 %s 已删除，配置数据已清空" % (", ".join(removed) or "无"))
+        log("一键卸载完成：容器已移除，配置目录 %s 已删除，配置数据已清空（失败：%s）" % (
+            ", ".join(removed) or "无",
+            "; ".join(failed) or "无"))
         self._json({
             "ok": True,
-            "message": "已卸载并删除全部数据：容器、配置映射目录（%s）与应用配置均已清除" % (", ".join(removed) or "无"),
+            "message": "已卸载并删除全部数据：容器、配置映射目录（%s）与应用配置均已清除%s" % (
+                ", ".join(removed) or "无",
+                ("；失败项：" + "; ".join(failed)) if failed else ""),
             "config_dir_removed": removed,
+            "config_dir_failed": failed,
         })
 
     def api_container_restart(self):
@@ -1548,12 +1852,23 @@ function doSubmit(){
         name_prefix = body.get("name_prefix") or ""
         try:
             route = self._parse_route(body)
-            created = batch_create_peers(state, count, name_prefix, route)
+            created, errors = batch_create_peers(state, count, name_prefix, route)
         except ValueError as e:
             self._bad(str(e))
             return
-        log("批量创建客户端: %d 个（前缀 %s）" % (len(created), name_prefix or "client"))
-        self._json({"ok": True, "peers": created, "message": "已批量创建 %d 个客户端" % len(created)})
+        log("批量创建客户端: %d 个（前缀 %s，失败 %d 个）" % (
+            len(created), name_prefix or "client", len(errors)))
+        # Bug 5：返回 errors 让前端能展示失败明细
+        msg = "已批量创建 %d 个客户端" % len(created)
+        if errors:
+            msg += "，%d 个失败" % len(errors)
+        self._json({
+            "ok": True,
+            "peers": created,
+            "errors": [{"name": n, "error": e} for n, e in errors],
+            "message": msg,
+            "has_failures": bool(errors),
+        })
 
     def _parse_route(self, body):
         """解析客户端路由：full=全量代理 / split=分流（指定内网网段）。"""
@@ -1640,7 +1955,8 @@ function doSubmit(){
         # 导出时清除会话令牌（安全考虑）
         export = json.loads(json.dumps(state))
         if "auth" in export:
-            export["auth"]["session_token"] = ""
+            # Bug 3：清除会话列表（不再用 session_token）
+            export["auth"]["sessions"] = []
         body = json.dumps(export, ensure_ascii=False, indent=2).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -1658,6 +1974,9 @@ function doSubmit(){
         state = load_state()
         # 保留当前认证配置（不允许通过导入覆盖密码）
         current_auth = state.get("auth", {})
+        # Bug 3：清理过期会话，避免导入时遗留无效 token
+        current_auth = dict(current_auth)
+        current_auth["sessions"] = _gc_sessions(current_auth.get("sessions") or [])
         try:
             # body 可能是完整的 state 对象，也可能是嵌套在 data 字段中
             imported = body.get("data") if "data" in body else body
@@ -1682,6 +2001,10 @@ function doSubmit(){
             if ok:
                 fresh["config_dirty"] = False
                 save_state(fresh)
+            else:
+                # Bug 15B：应用失败时标记 dirty，前端可看到「待应用」状态
+                fresh["config_dirty"] = True
+                save_state(fresh)
         log("配置已导入（应用 %s）" % ("成功" if applied else "失败：" + apply_msg))
         if applied:
             self._json({"ok": True, "message": "配置已导入并应用到运行时"})
@@ -1695,7 +2018,12 @@ function doSubmit(){
 
     # ---- 日志 ----
     def log_message(self, fmt, *args):
-        log("[http] %s - %s" % (self.address_string(), fmt % args))
+        # Bug 13：直接使用 client IP 字符串，避免反向 DNS 查询拖慢请求
+        try:
+            ip = self.client_address[0]
+        except Exception:
+            ip = "?"
+        log("[http] %s - %s" % (ip, fmt % args))
 
 
 def main():
