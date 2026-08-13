@@ -30,7 +30,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-VERSION = "0.3.4"
+VERSION = "0.3.5"
 
 # 状态文件写入锁（并发请求下防止 tmp 文件竞争）
 _state_lock = threading.Lock()
@@ -386,11 +386,12 @@ def check_auth(handler):
     return True
 
 
-def check_csrf(handler):
+def check_csrf(handler, allow_origin_only=False):
     """CSRF 校验（Bug 1）：
     - GET/HEAD/OPTIONS 不校验
     - 优先校验 X-CSRF-Token 头
     - 兜底校验 Origin/Referer 与 Host 同源
+    - allow_origin_only=True：允许仅通过 Origin 同源通过（setup/login 等无会话场景）
     返回 True 表示通过。
     """
     if handler.command not in _CSRF_METHODS:
@@ -402,7 +403,8 @@ def check_csrf(handler):
         for s in state.get("auth", {}).get("sessions") or []:
             if s.get("csrf_token") and secrets.compare_digest(csrf, s["csrf_token"]):
                 return True
-        return False
+        if not allow_origin_only:
+            return False
     # 2) 兜底：Origin / Referer 同源
     host = handler.headers.get("Host", "")
     origin = handler.headers.get("Origin", "") or handler.headers.get("Referer", "")
@@ -1067,6 +1069,16 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- 路由 ----
     def do_GET(self):
+        try:
+            return self._do_get_safe()
+        except Exception as e:
+            log("do_GET 异常: %s %s" % (self.path, e))
+            try:
+                self._json({"ok": False, "error": "服务器内部错误"}, 500)
+            except Exception:
+                pass
+
+    def _do_get_safe(self):
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/") or "/"
 
@@ -1116,19 +1128,25 @@ class Handler(BaseHTTPRequestHandler):
             return self._route_post()
         except _BodyTooLarge:
             return  # 已发送 413 响应
+        except Exception as e:
+            log("do_POST 异常: %s %s" % (self.path, e))
+            try:
+                self._json({"ok": False, "error": "服务器内部错误"}, 500)
+            except Exception:
+                pass
 
     def _route_post(self):
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/")
 
-        # 无需认证的路由（但需 CSRF 校验，Bug 1）
+        # 无需认证的路由（setup/login 等无会话场景使用 allow_origin_only 宽松 CSRF，避免死锁）
         if path == "/api/auth/setup":
-            if not check_csrf(self):
+            if not check_csrf(self, allow_origin_only=True):
                 self._json({"ok": False, "error": "CSRF 校验失败"}, 403)
                 return
             return self.api_auth_setup()
         if path == "/api/auth/login":
-            if not check_csrf(self):
+            if not check_csrf(self, allow_origin_only=True):
                 self._json({"ok": False, "error": "CSRF 校验失败"}, 403)
                 return
             return self.api_auth_login()
@@ -1190,6 +1208,12 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"ok": False, "error": "not found"}, 404)
         except _BodyTooLarge:
             return
+        except Exception as e:
+            log("do_PUT 异常: %s %s" % (self.path, e))
+            try:
+                self._json({"ok": False, "error": "服务器内部错误"}, 500)
+            except Exception:
+                pass
 
     def do_DELETE(self):
         try:
@@ -1207,6 +1231,12 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"ok": False, "error": "not found"}, 404)
         except _BodyTooLarge:
             return
+        except Exception as e:
+            log("do_DELETE 异常: %s %s" % (self.path, e))
+            try:
+                self._json({"ok": False, "error": "服务器内部错误"}, 500)
+            except Exception:
+                pass
 
     # ---- 静态文件 ----
     def serve_file(self, name, ctype):
@@ -2032,39 +2062,46 @@ def main():
     ap.add_argument("--host", default="0.0.0.0")
     args = ap.parse_args()
 
-    os.makedirs(BASE_DIR, exist_ok=True)
-    os.makedirs(WEB_DIR, exist_ok=True)
+    try:
+        os.makedirs(BASE_DIR, exist_ok=True)
+        os.makedirs(WEB_DIR, exist_ok=True)
+    except Exception as e:
+        log("初始化目录失败: %s" % e)
+
     mode = get_mode()
     log("fn-wg-web %s 启动，监听 %s:%d（数据目录 %s，模式 %s）" % (
         VERSION, args.host, args.port, BASE_DIR, mode))
     if mode == "container":
-        cfg = container_config_dir()
-        if cfg:
-            log("已接管容器 %s，配置目录 %s" % (CONTAINER_NAME, cfg))
-            state = load_state()
-            state["container"]["config_dir"] = cfg
-            state["container"]["deployed"] = True
-            conf = os.path.join(cfg, "wg_confs", "wg0.conf")
-            priv = read_conf_private_key(conf)
-            if priv and priv != state.get("server_private_key") and is_valid_key(priv):
-                # 同步实际服务器密钥（避免与 wg0.conf 不一致导致客户端无法握手）
-                state["server_private_key"] = priv
-                state["server_public_key"] = derive_pub(priv)
-            elif not (priv and is_valid_key(priv)) and not is_valid_key(state.get("server_private_key")):
-                # wg0.conf 密钥缺失/非法（如之前被写入伪密钥）→ 生成真实密钥修复并重启容器
-                log("检测到 wg0.conf 密钥无效，正在生成真实密钥修复...")
-                try:
-                    state["server_private_key"] = gen_key()
-                    state["server_public_key"] = derive_pub(state["server_private_key"])
-                    write_conf(state)
-                    run_cmd(["docker", "restart", CONTAINER_NAME], timeout=60)
-                    time.sleep(3)
-                except RuntimeError as e:
-                    log("自动修复密钥失败：%s" % e)
-            if state.get("server_public_key") and not state.get("server_ip"):
-                net = ipaddress_ip_network(state["settings"]["subnet"])
-                state["server_ip"] = str(net.network_address + 1)
-            save_state(state)
+        try:
+            cfg = container_config_dir()
+            if cfg:
+                log("已接管容器 %s，配置目录 %s" % (CONTAINER_NAME, cfg))
+                state = load_state()
+                state["container"]["config_dir"] = cfg
+                state["container"]["deployed"] = True
+                conf = os.path.join(cfg, "wg_confs", "wg0.conf")
+                priv = read_conf_private_key(conf)
+                if priv and priv != state.get("server_private_key") and is_valid_key(priv):
+                    # 同步实际服务器密钥（避免与 wg0.conf 不一致导致客户端无法握手）
+                    state["server_private_key"] = priv
+                    state["server_public_key"] = derive_pub(priv)
+                elif not (priv and is_valid_key(priv)) and not is_valid_key(state.get("server_private_key")):
+                    # wg0.conf 密钥缺失/非法（如之前被写入伪密钥）→ 生成真实密钥修复并重启容器
+                    log("检测到 wg0.conf 密钥无效，正在生成真实密钥修复...")
+                    try:
+                        state["server_private_key"] = gen_key()
+                        state["server_public_key"] = derive_pub(state["server_private_key"])
+                        write_conf(state)
+                        run_cmd(["docker", "restart", CONTAINER_NAME], timeout=60)
+                        time.sleep(3)
+                    except RuntimeError as e:
+                        log("自动修复密钥失败：%s" % e)
+                if state.get("server_public_key") and not state.get("server_ip"):
+                    net = ipaddress_ip_network(state["settings"]["subnet"])
+                    state["server_ip"] = str(net.network_address + 1)
+                save_state(state)
+        except Exception as e:
+            log("容器模式初始化异常（不影响 Web 服务启动）: %s" % e)
 
     try:
         server = ThreadingHTTPServer((args.host, args.port), Handler)
@@ -2074,6 +2111,10 @@ def main():
     except OSError as e:
         log("端口 %d 监听失败: %s" % (args.port, e))
         sys.exit(1)
+    except Exception as e:
+        log("服务异常: %s" % e)
+        # 致命错误退出，但确保有日志
+        sys.exit(2)
 
 
 if __name__ == "__main__":
