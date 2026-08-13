@@ -1,0 +1,28 @@
+# Default: let Git normalize line endings on checkin/checkout
+* text=auto
+
+# 运行在 Linux/fnOS 的脚本必须强制 LF，无论在哪个平台 checkout
+pkg/fnos/cmd/**  text eol=lf
+*.py             text eol=lf
+*.sh             text eol=lf
+*.cgi            text eol=lf
+
+# Web 资源（跨平台可运行，统一 LF 更清爽）
+*.html           text eol=lf
+*.css            text eol=lf
+*.js             text eol=lf
+*.json           text eol=lf
+*.md             text eol=lf
+*.yml            text eol=lf
+*.yaml           text eol=lf
+
+# 二进制：永不做换行归一化，且 diff 不显示
+*.fpk            binary
+*.png            binary
+*.jpg            binary
+*.jpeg           binary
+*.gif            binary
+*.ico            binary
+*.exe            binary
+*.dll            binary
+*.pyc            binary
