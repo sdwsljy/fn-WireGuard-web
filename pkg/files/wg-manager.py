@@ -30,7 +30,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-VERSION = "0.3.5"
+VERSION = "0.3.9"
 
 # 状态文件写入锁（并发请求下防止 tmp 文件竞争）
 _state_lock = threading.Lock()
@@ -54,20 +54,53 @@ class _BodyTooLarge(Exception):
     pass
 
 # ---------------------------------------------------------------------------
-# 路径与环境
+# 路径与环境（对齐 fnOS 官方 resource / 环境变量规范）
 # ---------------------------------------------------------------------------
-# 目录策略（与 fnOS 官方 fpk 标准一致）：
-#   BASE_DIR  程序文件目录（web 静态资源等），默认 /usr/fn-wg-web
-#   DATA_DIR  数据目录（state.json 配置），优先官方持久卷
-#             /var/apps/fn-wg-web/var （→ /usr/local/apps/@appdata/fn-wg-web，升级/卸载保留）
-#   兼容旧版本：未设置 WG_DATA_BASE 时沿用 BASE_DIR（state.json 在程序目录）
-BASE_DIR = os.environ.get("WG_WEB_BASE", "/usr/fn-wg-web")
-DATA_DIR = os.environ.get("WG_DATA_BASE", "") or BASE_DIR
-CONF_DIR = "/etc/wireguard"
-CONF_FILE = os.path.join(CONF_DIR, "wg0.conf")
+# 完整 TRIM_* 官方目录与优先级（fnOS 安装后 /var/apps/<appname> 下的软链）：
+#   target/  → TRIM_APPDEST   程序文件   /vol[x]/@appcenter/<appname>
+#   etc/     → TRIM_PKGETC    静态配置   /vol[x]/@appconf/<appname>
+#   var/     → TRIM_PKGVAR    运行时数据 /vol[x]/@appdata/<appname>
+#   home/    → TRIM_PKGHOME   用户数据   /vol[x]/@apphome/<appname>
+#   tmp/     → TRIM_PKGTMP    临时文件   /vol[x]/@apptemp/<appname>
+#   meta/    → TRIM_PKGMETA   元数据     /vol[x]/@appmeta/<appname>
+# 其他常用信息变量：
+#   TRIM_APPNAME / TRIM_APPVER  来自 manifest 的应用名/版本
+#   TRIM_SERVICE_PORT           manifest 中声明的服务端口
+#   TRIM_TEMP_LOGFILE           生命周期脚本临时日志
+#
+# 目录策略：
+#   BASE_DIR  程序文件目录    WG_WEB_BASE → TRIM_APPDEST → /usr/fn-wg-web（旧/本地）
+#   ETC_DIR   静态配置目录    WG_ETC_BASE  → TRIM_PKGETC → DATA_DIR/etc（回退）
+#   DATA_DIR  运行时数据目录  WG_DATA_BASE → TRIM_PKGVAR → BASE_DIR（本地回退）
+#   LOG_FILE  运行日志        WG_LOG_FILE  → DATA_DIR/fn-wg-web.log → /var/log/fn-wg-web.log（兼容）
+BASE_DIR = (
+    os.environ.get("WG_WEB_BASE")
+    or os.environ.get("TRIM_APPDEST")
+    or "/usr/fn-wg-web"
+)
+DATA_DIR = (
+    os.environ.get("WG_DATA_BASE")
+    or os.environ.get("TRIM_PKGVAR")
+    or BASE_DIR
+)
+ETC_DIR = (
+    os.environ.get("WG_ETC_BASE")
+    or os.environ.get("TRIM_PKGETC")
+    or os.path.join(DATA_DIR, "etc")
+)
+APP_NAME = os.environ.get("TRIM_APPNAME", "fn-wg-web")
+APP_VER = os.environ.get("TRIM_APPVER") or VERSION or "0.0.0"
+
+# Native 模式 wireguard 系统配置目录（不属于应用目录，系统级固定路径）
+SYS_WG_CONF_DIR = "/etc/wireguard"
+CONF_FILE = os.path.join(SYS_WG_CONF_DIR, "wg0.conf")
+
 STATE_FILE = os.path.join(DATA_DIR, "state.json")
 WEB_DIR = os.path.join(BASE_DIR, "web")
-LOG_FILE = "/var/log/fn-wg-web.log"
+LOG_FILE = (
+    os.environ.get("WG_LOG_FILE")
+    or os.path.join(DATA_DIR, "fn-wg-web.log")
+)
 
 CONTAINER_NAME = os.environ.get("WG_CONTAINER_NAME", "wireguard")
 CONTAINER_IMAGE = os.environ.get("WG_CONTAINER_IMAGE", "linuxserver/wireguard:latest")
@@ -260,6 +293,158 @@ DEFAULT_STATE = {
         "sessions": [],
     },
 }
+
+
+def _safe_migrate_file(src, dst):
+    """
+    无损迁移+清理单个文件（Python 侧与 shell 侧 _safe_migrate_file 同构）。
+    三步：1) 目标不存在才 copy2；2) 校验 src/dst 都存在、dst 非空、字节数一致；
+          3) 校验通过才删除 src 原件，绝不盲删。
+    返回 True 表示执行了「复制→校验→删除源」全部流程（即迁移并清理成功）。
+    """
+    try:
+        if not os.path.isfile(src):
+            return False
+        # Step 1: 复制（仅当目标不存在）
+        if not os.path.exists(dst):
+            os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
+            import shutil
+            shutil.copy2(src, dst)
+        # Step 2: 校验
+        if not (os.path.isfile(src) and os.path.isfile(dst)):
+            return False
+        ss = os.path.getsize(src)
+        ds = os.path.getsize(dst)
+        if ds <= 0 or ss != ds:
+            return False
+        # Step 3: 删除 src 原件（仅单文件）
+        try:
+            os.remove(src)
+        except Exception:
+            return False
+        # 再次确认 src 不存在，才算清理成功
+        return not os.path.exists(src)
+    except Exception:
+        return False
+
+
+def _migrate_legacy_data_on_startup():
+    """
+    无损升级：Python 进程内最后一层迁移兜底（与 install_callback/upgrade_callback/main 同构）。
+    每类迁移执行【复制（仅目标不存在）→ 校验目标非空且字节数等于源 → 删除原件】三步；
+    目录仅用非递归 os.rmdir 清理完全空的壳；不保留未识别的文件在 LEGACY_DIR 里（只删已确认迁移的）。
+    """
+    LEGACY_DIR = "/usr/fn-wg-web"
+    LEGACY_BACKUP = os.path.join(DATA_DIR, "legacy-backup")
+    cleaned_any = False
+
+    # 1) state.json
+    legacy_state = os.path.join(LEGACY_DIR, "state.json")
+    if os.path.isfile(legacy_state):
+        if os.path.isfile(STATE_FILE):
+            # state.json 已在持久卷；尺寸一致时删旧副本
+            try:
+                ss = os.path.getsize(legacy_state)
+                ds = os.path.getsize(STATE_FILE)
+                if ds > 0 and ss == ds:
+                    try:
+                        os.remove(legacy_state)
+                        if not os.path.exists(legacy_state):
+                            log("启动迁移兜底：已清理与持久卷一致的旧 state.json (%s, %dB)" % (legacy_state, ds))
+                            cleaned_any = True
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        else:
+            if _safe_migrate_file(legacy_state, STATE_FILE):
+                log("启动迁移兜底：state.json 已迁移并清理原件 %s → %s" % (legacy_state, STATE_FILE))
+                cleaned_any = True
+
+    # 2) 旧日志 /var/log/fn-wg-web.log* → DATA_DIR
+    var_log = "/var/log"
+    if os.path.isdir(var_log):
+        try:
+            for name in os.listdir(var_log):
+                if name == "fn-wg-web.log" or name.startswith("fn-wg-web.log."):
+                    src = os.path.join(var_log, name)
+                    dst = os.path.join(DATA_DIR, name)
+                    if _safe_migrate_file(src, dst):
+                        log("启动迁移兜底：旧日志已迁移并清理原件 %s → %s" % (src, dst))
+                        cleaned_any = True
+        except Exception:
+            pass
+
+    # 3) LEGACY_DIR/etc → ETC_DIR（逐文件；迁完自底向上清理空目录壳）
+    legacy_etc = os.path.join(LEGACY_DIR, "etc")
+    if os.path.isdir(legacy_etc):
+        files_touched = []
+        for root, _dirs, files in os.walk(legacy_etc):
+            for f in files:
+                src = os.path.join(root, f)
+                rel = os.path.relpath(src, legacy_etc)
+                dst = os.path.join(ETC_DIR, rel)
+                if _safe_migrate_file(src, dst):
+                    log("启动迁移兜底：静态配置已迁移并清理原件 %s → %s" % (src, dst))
+                    cleaned_any = True
+                    files_touched.append(src)
+        # 自底向上 rmdir 清理 legacy_etc 下所有空目录
+        try:
+            for r, dirs, fs in os.walk(legacy_etc, topdown=False):
+                for d in dirs:
+                    p = os.path.join(r, d)
+                    try:
+                        os.rmdir(p)
+                    except Exception:
+                        pass
+            try:
+                os.rmdir(legacy_etc)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    # 4) LEGACY_DIR 下散落的 *.json/*.conf → legacy-backup/（state.json 除外）
+    if os.path.isdir(LEGACY_DIR):
+        try:
+            for name in os.listdir(LEGACY_DIR):
+                if not (name.endswith(".json") or name.endswith(".conf")):
+                    continue
+                src = os.path.join(LEGACY_DIR, name)
+                if not os.path.isfile(src):
+                    continue
+                os.makedirs(LEGACY_BACKUP, exist_ok=True)
+                dst = os.path.join(LEGACY_BACKUP, name)
+                if name == "state.json" and os.path.isfile(STATE_FILE):
+                    continue  # state.json 已经主路径处理
+                if _safe_migrate_file(src, dst):
+                    log("启动迁移兜底：散落配置已备份并清理原件 %s → %s" % (src, dst))
+                    cleaned_any = True
+        except Exception:
+            pass
+
+    # 最后：LEGACY_DIR 若完全空 → 删除目录壳
+    if os.path.isdir(LEGACY_DIR):
+        try:
+            # 自底向上 rmdir 清 LEGACY_DIR 的空子目录
+            for r, dirs, fs in os.walk(LEGACY_DIR, topdown=False):
+                for d in dirs:
+                    p = os.path.join(r, d)
+                    try:
+                        os.rmdir(p)
+                    except Exception:
+                        pass
+            try:
+                os.rmdir(LEGACY_DIR)
+                if not os.path.isdir(LEGACY_DIR):
+                    log("启动迁移兜底：旧运行目录 %s 已空，已清理壳目录" % LEGACY_DIR)
+                    cleaned_any = True
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    return cleaned_any
 
 
 def load_state():
@@ -2064,13 +2249,21 @@ def main():
 
     try:
         os.makedirs(BASE_DIR, exist_ok=True)
+        os.makedirs(ETC_DIR, exist_ok=True)
+        os.makedirs(DATA_DIR, exist_ok=True)
         os.makedirs(WEB_DIR, exist_ok=True)
     except Exception as e:
         log("初始化目录失败: %s" % e)
 
+    # 无损升级：最后一层 Python 侧迁移兜底（仅当目标不存在才迁，原件保留不删）
+    try:
+        _migrate_legacy_data_on_startup()
+    except Exception as e:
+        log("旧数据迁移兜底阶段异常（已忽略）: %s" % e)
+
     mode = get_mode()
-    log("fn-wg-web %s 启动，监听 %s:%d（数据目录 %s，模式 %s）" % (
-        VERSION, args.host, args.port, BASE_DIR, mode))
+    log("%s %s 启动，监听 %s:%d（程序目录 %s，配置目录 %s，数据目录 %s，日志 %s，模式 %s）" % (
+        APP_NAME, APP_VER, args.host, args.port, BASE_DIR, ETC_DIR, DATA_DIR, LOG_FILE, mode))
     if mode == "container":
         try:
             cfg = container_config_dir()

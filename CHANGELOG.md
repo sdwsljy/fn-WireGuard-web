@@ -2,6 +2,62 @@
 
 所有重要变更记录在此文件。格式参照 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.3.9] - 2026-08-14
+
+### 变更
+
+- **无损升级后清理旧文件（四层同步升级安全删除流程）**：将 0.3.8 的「仅复制保留原件」策略升级为【复制→校验→删除原件】三步安全流程，在 4 个入口同构执行：
+  - 校验条件：src/dst 都存在、dst **非空**、**字节数完全相等**，三者同时满足才删除源；任一不满足则保留原件并日志告警
+  - 只删**单个具体文件**，绝不使用任何 `rm -rf` 或递归删除目录命令
+  - 目录清理仅使用非递归 `rmdir`/`os.rmdir`，只移除**完全空**的目录壳
+  - `LEGACY_DIR (/usr/fn-wg-web)` 自底向上尝试 `rmdir` 清空壳目录，任何非空目录都会自然保留
+- **覆盖的四类旧数据**（与 0.3.8 相同，但全部升级为迁完清理）：
+  1. `state.json`：`/usr/fn-wg-web/state.json` → `$TRIM_PKGVAR/state.json`（持久卷已有时按尺寸校验删旧副本）
+  2. 日志：`/var/log/fn-wg-web.log*`（含 `.1`/`.2` 轮转历史）→ `$DATA_DIR/`
+  3. 静态配置：`/usr/fn-wg-web/etc/**/*` → `$TRIM_PKGETC/**/*`（文件迁完清空 ETC 空目录壳）
+  4. 散落配置备份：`/usr/fn-wg-web/*.{json,conf}` → `$DATA_DIR/legacy-backup/`（state.json 已迁过主路径则跳过）
+
+## [0.3.8] - 2026-08-14
+
+### 变更
+
+- **无损升级迁移四层兜底增强**：迁移逻辑在 4 个独立入口同构、幂等、目标不存在才迁、原件保留不删，确保跨版本升级绝对无损：
+  - ① `cmd/install_callback`（安装/覆盖安装阶段）
+  - ② `cmd/upgrade_callback`（升级阶段）
+  - ③ `cmd/main start`（服务启动前，shell 侧）
+  - ④ `wg-manager.py` `_migrate_legacy_data_on_startup()`（Python 进程内最后一层兜底）
+- **迁移覆盖 4 类旧数据**：
+  1. `state.json`：`/usr/fn-wg-web/state.json` → `$TRIM_PKGVAR/state.json`（主配置）
+  2. 旧日志：`/var/log/fn-wg-web.log*`（含轮转历史） → `$DATA_DIR/`（与新日志共存于官方持久卷）
+  3. 静态配置：`/usr/fn-wg-web/etc/**/*` → `$TRIM_PKGETC`（递归、保持相对路径）
+  4. 散落配置备份：`/usr/fn-wg-web/*.{json,conf}` → `$DATA_DIR/legacy-backup/`（无损兜底，state.json 迁过主路径后不再重复备份）
+- 所有迁移均为「复制 + 目标不存在才覆盖」策略，`/usr/fn-wg-web` 旧目录下的原件完整保留，便于用户随时手动回滚/核对。
+
+## [0.3.7] - 2026-08-14
+
+### 变更
+
+- **完整对齐 fnOS 官方规范（查缺补漏）**：
+  - 补齐对 `TRIM_PKGETC`（静态配置目录）的感知，目录解析优先级：`WG_ETC_BASE` → `TRIM_PKGETC` → `DATA_DIR/etc`（回退），并在启动时自动 `mkdir -p`
+  - 补齐 `TRIM_APPNAME` / `TRIM_APPVER`（manifest 信息）在启动日志中的展示
+  - 补齐 `TRIM_TEMP_LOGFILE` 输出：`cmd/main` 未知命令错误写入官方临时日志
+  - 运行日志从硬编码 `/var/log/fn-wg-web.log` 改为优先写入 `$TRIM_PKGVAR/fn-wg-web.log`（持久卷内），与应用数据共存；升级时自动迁移旧日志
+  - `cmd/main` 显式通过环境变量 `WG_WEB_BASE/WG_ETC_BASE/WG_DATA_BASE/WG_LOG_FILE` 传递目录决策，避免 Python 端对 `TRIM_*` 的回退依赖在边界场景错位
+  - `manifest` 新增 `disable_authorization_path = true`：本应用不使用 fnOS 系统目录授权机制（用户直接在 Web UI 填写路径），隐藏无用「授权目录」设置项
+  - `manifest` 新增 `changelog` 字段，在应用中心更新页面展示更新摘要
+  - `uninstall_callback` 日志清理同时覆盖持久卷新位置与历史 `/var/log` 位置，`state.json` 保留便于用户重装复用
+
+## [0.3.6] - 2026-08-14
+
+### 变更
+
+- **存储结构对齐 fnOS 官方 resource 规范**（[官方文档](https://developer.fnnas.com/docs/core-concepts/resource/)）：
+  - 程序文件直接从官方安装目标 `TRIM_APPDEST` 运行，不再每次启动复制到自建 `/usr/fn-wg-web`（去除冗余拷贝）
+  - 持久数据改用官方持久卷环境变量 `TRIM_PKGVAR`，不再硬编码 `/var/apps/fn-wg-web/var`
+  - `wg-manager.py` 的 `BASE_DIR`/`DATA_DIR` 解析优先级调整为：显式覆盖（`WG_WEB_BASE`/`WG_DATA_BASE`）→ 官方变量（`TRIM_APPDEST`/`TRIM_PKGVAR`）→ 旧路径/本地开发回退
+  - 生命周期脚本（main/install/upgrade/uninstall）统一改用官方环境变量，旧版本 `/usr/fn-wg-web` 数据在安装/升级时一次性迁移到官方持久卷
+  - 卸载时程序文件交由官方流程清理，仅清理历史遗留运行目录与日志
+
 ## [0.3.3] - 2026-08-11
 
 ### 修复

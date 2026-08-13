@@ -1,37 +1,115 @@
 #!/bin/bash
 # fn-wg-web - WireGuard 服务端可视化管理（fnOS 应用生命周期脚本）
-# 安装后（install_type=root），工具文件位于 TRIM_APPDEST
-# （/usr/local/apps/@appcenter/fn-wg-web/target），启动时初始化到运行目录并启动 Web 管理服务。
+#
+# 目录策略（对齐 fnOS 官方 resource / 环境变量规范）：
+#   程序文件目录  TRIM_APPDEST  （/usr/local/apps/@appcenter/fn-wg-web/target）
+#   静态配置目录  TRIM_PKGETC   （官方 etc/，→ /vol[x]/@appconf/fn-wg-web）
+#   运行时数据    TRIM_PKGVAR   （官方 var/，→ /vol[x]/@appdata/fn-wg-web）
+#   服务端口      TRIM_SERVICE_PORT（默认 51821）
+#   临时日志      TRIM_TEMP_LOGFILE（生命周期脚本错误输出）
+#   应用名/版本    TRIM_APPNAME / TRIM_APPVER（来自 manifest）
+#
+# 无损升级迁移 + 清理（start 阶段最后兜底）：每类迁移都按
+#   【复制（仅当目标不存在）→ 校验目标非空且尺寸等于源 → 删除原件】
+# 三步执行；绝不盲删整目录，目录仅用非递归 rmdir 清理完全空壳。
 # WireGuard 服务端运行在 linuxserver/wireguard 容器中（应用界面一键部署）。
-# 目录策略（与 fnOS 官方 fpk 标准一致）：
-#   程序文件目录  /usr/fn-wg-web            （web 静态资源，WG_WEB_BASE）
-#   数据目录      /var/apps/fn-wg-web/var   （state.json 配置，WG_DATA_BASE，
-#                                            → /usr/local/apps/@appdata/fn-wg-web，升级/卸载保留）
-#   旧版本数据在 /usr/fn-wg-web，首次启动自动迁移到持久卷。
-DEST_DIR="/usr/fn-wg-web"
-PERSIST_DIR="/var/apps/fn-wg-web/var"
-DATA_DIR="$PERSIST_DIR"
+set -u
+
+APPDEST="${TRIM_APPDEST:-/usr/local/apps/@appcenter/fn-wg-web/target}"
+ETC_DIR="${TRIM_PKGETC:-/var/apps/fn-wg-web/etc}"
+DATA_DIR="${TRIM_PKGVAR:-/var/apps/fn-wg-web/var}"
 SVC_PORT="${TRIM_SERVICE_PORT:-51821}"
+LEGACY_DIR="/usr/fn-wg-web"
+LEGACY_BACKUP="$DATA_DIR/legacy-backup"
+MANAGER="$APPDEST/wg-manager.py"
+
+# 运行日志：默认写进持久卷 DATA_DIR/fn-wg-web.log，与 wg-manager.py 内部 LOG_FILE 解析一致
+LOG_FILE="${WG_LOG_FILE:-$DATA_DIR/fn-wg-web.log}"
+
+# ===== 通用：安全迁移+清理单个文件 ==========================================
+_safe_migrate_file() {
+    local src="$1" dst="$2"
+    [ -f "$src" ] || return 0
+    if [ ! -f "$dst" ]; then
+        mkdir -p "$(dirname "$dst")" 2>/dev/null || true
+        cp -f "$src" "$dst" 2>/dev/null || true
+    fi
+    if [ -f "$src" ] && [ -f "$dst" ]; then
+        local ss ds
+        ss=$(stat -c '%s' "$src" 2>/dev/null || stat -f '%z' "$src" 2>/dev/null || echo "-1")
+        ds=$(stat -c '%s' "$dst" 2>/dev/null || stat -f '%z' "$dst" 2>/dev/null || echo "-2")
+        if [ "$ds" -gt 0 ] 2>/dev/null && [ "$ss" = "$ds" ] 2>/dev/null; then
+            rm -f "$src" 2>/dev/null || true
+            [ ! -e "$src" ] && echo "[fn-wg-web] main: 迁移并清理成功 $src (${ds}B) -> $dst" >>"$LOG_FILE" 2>/dev/null || true
+        fi
+    fi
+}
 
 case $1 in
 start)
-    # 1. 初始化程序文件（幂等）
-    mkdir -p "$DEST_DIR" "$PERSIST_DIR"
-    if [ -d "$TRIM_APPDEST" ]; then
-        cp -f "$TRIM_APPDEST"/wg-manager.py "$DEST_DIR/" 2>/dev/null || true
-        cp -rf "$TRIM_APPDEST"/web "$DEST_DIR/" 2>/dev/null || true
-        chmod +x "$DEST_DIR/wg-manager.py" 2>/dev/null || true
+    # 0. 目录初始化（幂等）
+    mkdir -p "$DATA_DIR" "$ETC_DIR" "$LEGACY_BACKUP"
+
+    # ===== 1) state.json =====================================================
+    if [ -f "$DATA_DIR/state.json" ] && [ -f "$LEGACY_DIR/state.json" ]; then
+        ss=$(stat -c '%s' "$LEGACY_DIR/state.json" 2>/dev/null || stat -f '%z' "$LEGACY_DIR/state.json" 2>/dev/null || echo "-1")
+        ds=$(stat -c '%s' "$DATA_DIR/state.json" 2>/dev/null || stat -f '%z' "$DATA_DIR/state.json" 2>/dev/null || echo "-2")
+        if [ "$ds" -gt 0 ] 2>/dev/null && [ "$ss" = "$ds" ] 2>/dev/null; then
+            rm -f "$LEGACY_DIR/state.json" 2>/dev/null || true
+        fi
+    elif [ ! -f "$DATA_DIR/state.json" ]; then
+        _safe_migrate_file "$LEGACY_DIR/state.json" "$DATA_DIR/state.json"
     fi
-    # 2. 旧版本数据迁移：/usr/fn-wg-web/state.json → 持久卷（只迁一次）
-    if [ -f "$DEST_DIR/state.json" ] && [ ! -f "$DATA_DIR/state.json" ]; then
-        cp -f "$DEST_DIR/state.json" "$DATA_DIR/state.json" 2>/dev/null || true
-        echo "[fn-wg-web] 配置已迁移到官方持久卷: $DATA_DIR"
+
+    # ===== 2) 旧日志（/var/log → DATA_DIR，含轮转历史）=====================
+    if [ -d /var/log ]; then
+        for oldlog in /var/log/fn-wg-web.log /var/log/fn-wg-web.log.*; do
+            [ -e "$oldlog" ] || continue
+            base=$(basename "$oldlog")
+            newlog="$DATA_DIR/$base"
+            _safe_migrate_file "$oldlog" "$newlog"
+        done
     fi
-    # 3. 启动 Web 管理服务（程序文件与数据目录分离）
+
+    # ===== 3) LEGACY_DIR/etc → TRIM_PKGETC =================================
+    if [ -d "$LEGACY_DIR/etc" ]; then
+        find "$LEGACY_DIR/etc" -type f 2>/dev/null | sort -r | while read -r src; do
+            rel="${src#$LEGACY_DIR/etc/}"
+            dst="$ETC_DIR/$rel"
+            _safe_migrate_file "$src" "$dst"
+        done
+        find "$LEGACY_DIR/etc" -depth -type d 2>/dev/null | while read -r d; do
+            rmdir "$d" 2>/dev/null || true
+        done
+        rmdir "$LEGACY_DIR/etc" 2>/dev/null || true
+    fi
+
+    # ===== 4) LEGACY_DIR 散落的 *.json/*.conf → legacy-backup =============
+    if [ -d "$LEGACY_DIR" ] && { ls "$LEGACY_DIR"/*.json "$LEGACY_DIR"/*.conf >/dev/null 2>&1; }; then
+        find "$LEGACY_DIR" -maxdepth 1 -type f \( -name "*.json" -o -name "*.conf" \) 2>/dev/null | while read -r src; do
+            base=$(basename "$src")
+            [ "$base" = "state.json" ] && continue
+            dst="$LEGACY_BACKUP/$base"
+            _safe_migrate_file "$src" "$dst"
+        done
+    fi
+
+    # ===== LEGACY_DIR 空壳清理 ==============================================
+    if [ -d "$LEGACY_DIR" ]; then
+        find "$LEGACY_DIR" -depth -type d 2>/dev/null | while read -r d; do
+            rmdir "$d" 2>/dev/null || true
+        done
+        rmdir "$LEGACY_DIR" 2>/dev/null || true
+    fi
+
+    # ===== 5) 启动 Web 管理服务 ============================================
     if ! pgrep -f "wg-manager.py --port ${SVC_PORT}" >/dev/null 2>&1; then
-        WG_WEB_BASE="$DEST_DIR" WG_DATA_BASE="$DATA_DIR" \
-            nohup python3 -u "$DEST_DIR/wg-manager.py" --port "$SVC_PORT" \
-            >/var/log/fn-wg-web.log 2>&1 &
+        WG_WEB_BASE="$APPDEST" \
+        WG_ETC_BASE="$ETC_DIR" \
+        WG_DATA_BASE="$DATA_DIR" \
+        WG_LOG_FILE="$LOG_FILE" \
+            nohup python3 -u "$MANAGER" --port "$SVC_PORT" \
+            >>"$LOG_FILE" 2>&1 &
         sleep 1
     fi
     exit 0
@@ -48,6 +126,11 @@ status)
     fi
     ;;
 *)
+    msg="Unknown command: $1"
+    if [ -n "${TRIM_TEMP_LOGFILE:-}" ]; then
+        echo "$msg" >>"$TRIM_TEMP_LOGFILE" 2>/dev/null || true
+    fi
+    echo "$msg" >&2
     exit 1
     ;;
 esac

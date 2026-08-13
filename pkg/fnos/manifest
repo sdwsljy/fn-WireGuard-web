@@ -1,5 +1,5 @@
 appname         = fn-wg-web
-version         = 0.3.5
+version         = 0.3.9
 display_name    = WireGuard 管理器
 platform        = all
 maintainer      = 胖啥胖
@@ -12,6 +12,8 @@ service_port    = 51821
 checkport       = false
 install_type    = root
 os_min_version  = 0.9.0
+disable_authorization_path = true
+changelog       = 0.3.9：无损升级后清理旧文件 —— 所有迁移均为【复制→校验(目标非空且字节数等于源)→单独删除原件】三步安全流程；目录仅用 rmdir 删完全空壳；绝不盲删整目录。0.3.8 增强了四层兜底迁移（install/upgrade/start/Python 启动）。0.3.x 存储结构对齐官方 resource 规范。
 desc            = WireGuard 管理器：在飞牛 NAS 上以 Docker 容器一键部署 WireGuard 服务端，浏览器全程可视化操作，无需命令行。点击部署自动拉取镜像、创建容器并生成密钥；支持填写公网 IP/域名、自定义 UDP 端口与内网网段、配置目录映射；一键创建/批量生成客户端，二维码与配置文件即扫即用；提供分流路由、在线状态、握手时间与实时流量统计。配置存于官方持久卷，升级不丢失，数据更安心。
 source          = thirdparty
 checksum        =

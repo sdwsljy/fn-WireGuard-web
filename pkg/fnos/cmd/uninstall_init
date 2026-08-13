@@ -1,9 +1,10 @@
 #!/bin/bash
 # 卸载前检查：若存在在线客户端将提示
-# Bug 7：按优先级依次检查官方持久卷与旧运行目录
+# 按优先级依次检查官方持久卷（TRIM_PKGVAR）与旧运行目录
+DATA_DIR="${TRIM_PKGVAR:-/var/apps/fn-wg-web/var}"
 STATE_FILE=""
-if [ -f /var/apps/fn-wg-web/var/state.json ]; then
-    STATE_FILE="/var/apps/fn-wg-web/var/state.json"
+if [ -f "$DATA_DIR/state.json" ]; then
+    STATE_FILE="$DATA_DIR/state.json"
 elif [ -f /usr/fn-wg-web/state.json ]; then
     STATE_FILE="/usr/fn-wg-web/state.json"
 fi

@@ -1,28 +1,124 @@
 #!/bin/bash
-# 安装完成处理（升级/覆盖安装同样执行本脚本）：
-# 1) 配置从官方持久卷读取（/var/apps/fn-wg-web/var，升级/覆盖安装自动保留）
-# 2) 按容器实况设置 deployed：容器仍在 → 已部署，无需重新部署
-# 3) 校验桌面图标注册所需文件
+# 安装完成处理（升级/覆盖安装同样执行本脚本）—— 无损升级后清理旧文件：
+#   迁移 4 类旧数据，每类都按【复制 → 校验目标非空且与原件字节数一致 → 单独删除原件】三步执行，
+#   绝不盲删整目录，目录仅用非递归 rmdir 清理完全空的壳。
+#   4 类：
+#     1) state.json        LEGACY_DIR/state.json  →  TRIM_PKGVAR/state.json
+#     2) 旧日志             /var/log/fn-wg-web.log*  →  DATA_DIR/*.log*
+#     3) LEGACY_DIR/etc/*   →  TRIM_PKGETC/*
+#     4) 散落 *.json/*.conf →  DATA_DIR/legacy-backup/  (此类仅 state.json 迁主路径后删原件)
+# 其余：按容器实况设置 deployed、校验桌面图标注册文件。
+# 程序文件直接位于 TRIM_APPDEST（官方安装目标），无需复制。
 set -u
 
 APP_NAME="fn-wg-web"
-TARGET="${TRIM_APPDEST:-/usr/local/apps/@appcenter/fn-wg-web}"
+TARGET="${TRIM_APPDEST:-/usr/local/apps/@appcenter/fn-wg-web/target}"
 UI_LINK="/var/apps_ui/${APP_NAME}"
-DEST="/usr/fn-wg-web"
-DATA_DIR="/var/apps/fn-wg-web/var"
+DATA_DIR="${TRIM_PKGVAR:-/var/apps/fn-wg-web/var}"
+ETC_DIR="${TRIM_PKGETC:-/var/apps/fn-wg-web/etc}"
+LEGACY_DIR="/usr/fn-wg-web"
+LEGACY_BACKUP="$DATA_DIR/legacy-backup"
 
-# 1. 配置落位到持久卷（cmd/main start 时会以持久卷为数据目录启动）
-mkdir -p "$DATA_DIR"
+# 0. 目录初始化
+mkdir -p "$DATA_DIR" "$ETC_DIR"
+
+# ===== 通用：安全迁移+清理单个文件 ==========================================
+# 用法：_safe_migrate_file <源文件> <目标文件>
+# 逻辑：目标不存在才复制 → 校验目标非空且尺寸等于源 → 删除源（校验失败绝不删源）
+_safe_migrate_file() {
+    local src="$1" dst="$2"
+    [ -f "$src" ] || return 0
+    # Step 1: 目标不存在才复制
+    if [ ! -f "$dst" ]; then
+        mkdir -p "$(dirname "$dst")" 2>/dev/null || true
+        cp -f "$src" "$dst" 2>/dev/null || true
+    fi
+    # Step 2: 校验 → 双文件都存在 + 目标非空 + 尺寸一致
+    if [ -f "$src" ] && [ -f "$dst" ]; then
+        local ss ds
+        ss=$(stat -c '%s' "$src" 2>/dev/null || stat -f '%z' "$src" 2>/dev/null || echo "-1")
+        ds=$(stat -c '%s' "$dst" 2>/dev/null || stat -f '%z' "$dst" 2>/dev/null || echo "-2")
+        if [ "$ds" -gt 0 ] 2>/dev/null && [ "$ss" = "$ds" ] 2>/dev/null; then
+            # Step 3: 删除源文件（仅单个文件，不碰目录）
+            rm -f "$src" 2>/dev/null || true
+            if [ ! -e "$src" ]; then
+                echo "[fn-wg-web] 迁移并清理成功: $src (${ds}B) -> $dst"
+            fi
+        else
+            echo "[fn-wg-web] 迁移校验未通过（src=$ss B, dst=$ds B），保留原件: $src"
+        fi
+    fi
+}
+
+# ===== 1) state.json（主配置）===============================================
 if [ -f "$DATA_DIR/state.json" ]; then
-    echo "[fn-wg-web] 配置已在官方持久卷（升级/覆盖安装保留），直接使用"
-elif [ -f "$DEST/state.json" ]; then
-    cp -f "$DEST/state.json" "$DATA_DIR/state.json" 2>/dev/null || true
-    echo "[fn-wg-web] 已从旧运行目录迁移配置到持久卷"
+    echo "[fn-wg-web] state.json 已在官方持久卷（升级/覆盖安装保留），跳过迁移"
+    # 但旧 LEGACY_DIR 下的 state.json 如存在且与新文件一致，清理旧副本
+    if [ -f "$LEGACY_DIR/state.json" ]; then
+        ss=$(stat -c '%s' "$LEGACY_DIR/state.json" 2>/dev/null || stat -f '%z' "$LEGACY_DIR/state.json" 2>/dev/null || echo "-1")
+        ds=$(stat -c '%s' "$DATA_DIR/state.json" 2>/dev/null || stat -f '%z' "$DATA_DIR/state.json" 2>/dev/null || echo "-2")
+        if [ "$ds" -gt 0 ] 2>/dev/null && [ "$ss" = "$ds" ] 2>/dev/null; then
+            rm -f "$LEGACY_DIR/state.json" 2>/dev/null || true
+            [ ! -e "$LEGACY_DIR/state.json" ] && echo "[fn-wg-web] 已清理与持久卷中完全一致的旧 state.json（$LEGACY_DIR/state.json, ${ds}B）"
+        fi
+    fi
 else
-    echo "[fn-wg-web] 全新安装，无历史配置"
+    _safe_migrate_file "$LEGACY_DIR/state.json" "$DATA_DIR/state.json"
+    if [ ! -f "$DATA_DIR/state.json" ] && [ ! -f "$LEGACY_DIR/state.json" ]; then
+        echo "[fn-wg-web] 全新安装，无历史 state.json"
+    fi
 fi
 
-# 2. 按容器实况设置 deployed（容器仍在 → 已部署，无需重新部署）
+# ===== 2) 旧日志迁移（/var/log → DATA_DIR，含 .1/.2 轮转）====================
+if [ -d /var/log ]; then
+    for oldlog in /var/log/fn-wg-web.log /var/log/fn-wg-web.log.*; do
+        [ -e "$oldlog" ] || continue
+        base=$(basename "$oldlog")
+        newlog="$DATA_DIR/$base"
+        _safe_migrate_file "$oldlog" "$newlog"
+    done
+fi
+
+# ===== 3) LEGACY_DIR/etc → TRIM_PKGETC（递归逐文件）==========================
+if [ -d "$LEGACY_DIR/etc" ]; then
+    # 先迁移+清理所有文件
+    find "$LEGACY_DIR/etc" -type f 2>/dev/null | sort -r | while read -r src; do
+        rel="${src#$LEGACY_DIR/etc/}"
+        dst="$ETC_DIR/$rel"
+        _safe_migrate_file "$src" "$dst"
+    done
+    # 清理 LEGACY_DIR/etc 下空目录（自底向上，非递归、只删空）
+    find "$LEGACY_DIR/etc" -depth -type d 2>/dev/null | while read -r d; do
+        rmdir "$d" 2>/dev/null || true
+    done
+    # 若 LEGACY_DIR/etc 整棵清空也尝试删
+    rmdir "$LEGACY_DIR/etc" 2>/dev/null || true
+fi
+
+# ===== 4) LEGACY_DIR 下散落的 *.json/*.conf 兜底备份 ========================
+# 只迁 state.json 以外的配置到 legacy-backup；迁成功且校验通过后也删原件（原件已被备份）
+if [ -d "$LEGACY_DIR" ] && { ls "$LEGACY_DIR"/*.json "$LEGACY_DIR"/*.conf >/dev/null 2>&1; }; then
+    mkdir -p "$LEGACY_BACKUP"
+    find "$LEGACY_DIR" -maxdepth 1 -type f \( -name "*.json" -o -name "*.conf" \) 2>/dev/null | while read -r src; do
+        base=$(basename "$src")
+        # state.json 已在第 1) 步处理过，不重复迁移
+        [ "$base" = "state.json" ] && continue
+        dst="$LEGACY_BACKUP/$base"
+        _safe_migrate_file "$src" "$dst"
+    done
+fi
+
+# ===== 最后：LEGACY_DIR 若完全空则删除壳（非递归、只删空）====================
+if [ -d "$LEGACY_DIR" ]; then
+    # 自底向上尝试删 LEGACY_DIR 下所有空目录，再看根目录是否也空
+    find "$LEGACY_DIR" -depth -type d 2>/dev/null | while read -r d; do
+        rmdir "$d" 2>/dev/null || true
+    done
+    rmdir "$LEGACY_DIR" 2>/dev/null || true
+    [ ! -d "$LEGACY_DIR" ] && echo "[fn-wg-web] 旧运行目录 $LEGACY_DIR 已空，已清理壳目录"
+fi
+
+# ===== 5) 按容器实况设置 deployed ===========================================
 if [ -f "$DATA_DIR/state.json" ]; then
     if docker inspect wireguard >/dev/null 2>&1; then
         python3 -c "
@@ -44,7 +140,7 @@ json.dump(s, open(p, 'w'), ensure_ascii=False, indent=2)
     fi
 fi
 
-# 3. 校验桌面图标注册文件
+# ===== 6) 校验桌面图标注册文件 ===============================================
 OK=1
 if [ ! -f "$TARGET/ui/config" ]; then
     echo "[fn-wg-web] 错误: target/ui/config 不存在，桌面图标将无法注册"
