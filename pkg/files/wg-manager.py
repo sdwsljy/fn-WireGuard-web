@@ -22,6 +22,8 @@ import os
 import re
 import secrets
 import shutil
+import socket
+import socketserver
 import subprocess
 import sys
 import threading
@@ -30,7 +32,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-VERSION = "0.3.9"
+VERSION = "0.4.1"
 
 # 状态文件写入锁（并发请求下防止 tmp 文件竞争）
 _state_lock = threading.Lock()
@@ -111,6 +113,11 @@ DEFAULT_DNS = "1.1.1.1, 8.8.8.8"
 DEFAULT_KEEPALIVE = 25
 DEFAULT_CONFIG_DIR = "/vol1/docker/wireguard"
 
+# fnOS 统一网关前缀（ui/config 的 gatewayPrefix 声明）。
+# 生产模式应用不再监听独立 TCP 端口，Web 界面经 /app/fn-wg-web 由 fnOS 网关转发到
+# TRIM_APPDEST/app.sock（gatewaySocket）。--port 仅保留给本地开发/联调使用。
+GW_PREFIX = os.environ.get("WG_GATEWAY_PREFIX", "/app/fn-wg-web")
+
 # ---------------------------------------------------------------------------
 # 工具函数
 # ---------------------------------------------------------------------------
@@ -147,6 +154,25 @@ def which(bin_name):
 
 def docker_available():
     return which("docker") is not None
+
+
+def port_in_use(port):
+    """检查本机 TCP 端口是否已被占用（Web 管理端口，默认 51821）。
+
+    返回 True 表示端口已被其他进程监听，Web 服务无法启动。
+    用于在 fnOS 应用中心 checkport 之外再提供一层启动前自检与清晰报错。
+    """
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        try:
+            s.bind(("0.0.0.0", port))
+            return False
+        except OSError:
+            return True
+    finally:
+        s.close()
 
 
 def container_exists(name=CONTAINER_NAME):
@@ -1221,6 +1247,15 @@ def collect_peers_status(state):
 # HTTP 服务
 # ---------------------------------------------------------------------------
 
+# fnOS 统一网关模式：监听 Unix Socket 的线程化 HTTP 服务（不占用 TCP 端口）。
+# 仅当平台支持 AF_UNIX（fnOS/Linux）时可用；Windows 本地开发仅走 --port。
+if hasattr(socket, "AF_UNIX"):
+    class UnixThreadingHTTPServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+        daemon_threads = True
+else:
+    UnixThreadingHTTPServer = None
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "fn-wg-web/" + VERSION
 
@@ -1252,6 +1287,15 @@ class Handler(BaseHTTPRequestHandler):
     def _bad(self, msg):
         self._json({"ok": False, "error": msg}, 400)
 
+    def _norm_path(self, raw):
+        """剥离 fnOS 统一网关前缀，得到应用内部路径（兼容网关 /app/fn-wg-web 与直连两种模式）。"""
+        p = raw.rstrip("/") or "/"
+        if GW_PREFIX and p.startswith(GW_PREFIX):
+            p = p[len(GW_PREFIX):]
+            if not p:
+                p = "/"
+        return p
+
     # ---- 路由 ----
     def do_GET(self):
         try:
@@ -1265,7 +1309,16 @@ class Handler(BaseHTTPRequestHandler):
 
     def _do_get_safe(self):
         parsed = urlparse(self.path)
-        path = parsed.path.rstrip("/") or "/"
+        raw_path = parsed.path
+        # fnOS 统一网关：前缀裸路径（/app/fn-wg-web，无尾斜杠）302 到带尾斜杠，
+        # 保证相对资源（style.css / app.js / api/...）在网关挂载点下解析正确。
+        if GW_PREFIX and raw_path == GW_PREFIX:
+            self.send_response(302)
+            self.send_header("Location", GW_PREFIX + "/")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        path = self._norm_path(raw_path)
 
         # 无需认证的 API 路由
         if path == "/api/auth/status":
@@ -1322,7 +1375,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _route_post(self):
         parsed = urlparse(self.path)
-        path = parsed.path.rstrip("/")
+        path = self._norm_path(parsed.path)
 
         # 无需认证的路由（setup/login 等无会话场景使用 allow_origin_only 宽松 CSRF，避免死锁）
         if path == "/api/auth/setup":
@@ -1380,7 +1433,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_PUT(self):
         try:
             parsed = urlparse(self.path)
-            path = parsed.path.rstrip("/")
+            path = self._norm_path(parsed.path)
             if not check_auth(self):
                 self._json({"ok": False, "error": "未登录", "need_auth": True}, 401)
                 return
@@ -1403,7 +1456,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_DELETE(self):
         try:
             parsed = urlparse(self.path)
-            path = parsed.path.rstrip("/")
+            path = self._norm_path(parsed.path)
             if not check_auth(self):
                 self._json({"ok": False, "error": "未登录", "need_auth": True}, 401)
                 return
@@ -1498,7 +1551,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica N
 <script>
 var needSetup=false;
 var mode="login";
-fetch("/api/auth/status").then(function(r){return r.json()}).then(function(d){
+fetch("api/auth/status").then(function(r){return r.json()}).then(function(d){
   if(d.need_setup&&!d.authed){
     needSetup=true;
     mode="setup";
@@ -1531,7 +1584,7 @@ function doSubmit(){
   var btn=document.getElementById("loginBtn");
   btn.disabled=true;
   btn.textContent="请稍候...";
-  var url=mode==="setup"?"/api/auth/setup":"/api/auth/login";
+  var url=mode==="setup"?"api/auth/setup":"api/auth/login";
   fetch(url,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({password:pwd})})
     .then(function(r){return r.json()})
     .then(function(d){
@@ -2241,9 +2294,21 @@ function doSubmit(){
         log("[http] %s - %s" % (ip, fmt % args))
 
 
+def _env_int(name, default):
+    """安全读取环境变量为整数：部分 fnOS 版本在 manifest 无 service_port 时会把
+    TRIM_SERVICE_PORT 注入为非法文本，绝不能让其导致应用启动崩溃。"""
+    try:
+        return int(os.environ.get(name, ""))
+    except (TypeError, ValueError):
+        return default
+
+
 def main():
     ap = argparse.ArgumentParser(description="fn-wg-web WireGuard 管理服务")
-    ap.add_argument("--port", type=int, default=int(os.environ.get("TRIM_SERVICE_PORT", "51821")))
+    ap.add_argument("--socket", default=None,
+                    help="fnOS 统一网关 Unix Socket 路径（生产模式，如 ${TRIM_APPDEST}/app.sock，不占用 TCP 端口）")
+    ap.add_argument("--port", type=int, default=_env_int("TRIM_SERVICE_PORT", 51821),
+                    help="TCP 端口（仅本地开发/联调；生产模式请用 --socket）")
     ap.add_argument("--host", default="0.0.0.0")
     args = ap.parse_args()
 
@@ -2261,9 +2326,49 @@ def main():
     except Exception as e:
         log("旧数据迁移兜底阶段异常（已忽略）: %s" % e)
 
+    # ---- 第 0 步：先绑定监听（Socket/端口），避免 get_mode()（可能调用 docker，较慢）
+    # 阻塞就绪时间，导致 cmd/main 的 [ -S ] 等待超时误报「统一网关未就绪」。
+    try:
+        if args.socket:
+            if UnixThreadingHTTPServer is None:
+                log("当前平台不支持 Unix Socket（--socket 仅用于 fnOS/Linux 统一网关模式），请改用 --port 本地联调")
+                sys.exit(1)
+            sock_path = args.socket
+            # 清理可能遗留的陈旧 socket 文件
+            if os.path.exists(sock_path):
+                try:
+                    os.remove(sock_path)
+                except OSError:
+                    pass
+            server = UnixThreadingHTTPServer(sock_path, Handler)
+            try:
+                # 供 fnOS 统一网关进程连接（网关可能运行在不同用户下）
+                os.chmod(sock_path, 0o777)
+            except OSError as e:
+                log("警告：Socket 权限设置失败（fnOS 网关可能无法连接）: %s" % e)
+            listen_desc = "Unix Socket %s（统一网关 %s）" % (sock_path, GW_PREFIX)
+        else:
+            svc_port = args.port
+            # 启动前自检 Web 管理端口：被占用时给出明确报错（如 wg-easy 默认占用 51821），
+            # 避免静默绑定失败导致管理面板打不开。
+            if port_in_use(svc_port):
+                log("端口 %d 已被占用，Web 管理服务无法启动。请检查是否有其他应用/容器占用该端口"
+                    "（如 wg-easy 默认 Web 端口 51821），释放端口后重启应用。" % svc_port)
+                sys.exit(1)
+            server = ThreadingHTTPServer((args.host, svc_port), Handler)
+            listen_desc = "%s:%d" % (args.host, svc_port)
+    except OSError as e:
+        log("服务监听失败: %s（%s）" % (
+            e,
+            "统一网关 Socket %s" % args.socket if args.socket
+            else "端口 %d 可能已被其他服务占用，例如 wg-easy 默认使用 51821" % args.port))
+        sys.exit(1)
+
+    # ---- 第 1 步：模式检测（可能调用 docker，不影响监听就绪）----
     mode = get_mode()
-    log("%s %s 启动，监听 %s:%d（程序目录 %s，配置目录 %s，数据目录 %s，日志 %s，模式 %s）" % (
-        APP_NAME, APP_VER, args.host, args.port, BASE_DIR, ETC_DIR, DATA_DIR, LOG_FILE, mode))
+    log("%s %s 启动，监听 %s（程序目录 %s，配置目录 %s，数据目录 %s，日志 %s，模式 %s）" % (
+        APP_NAME, APP_VER, listen_desc, BASE_DIR, ETC_DIR, DATA_DIR, LOG_FILE, mode))
+
     if mode == "container":
         try:
             cfg = container_config_dir()
@@ -2297,17 +2402,18 @@ def main():
             log("容器模式初始化异常（不影响 Web 服务启动）: %s" % e)
 
     try:
-        server = ThreadingHTTPServer((args.host, args.port), Handler)
         server.serve_forever()
     except KeyboardInterrupt:
         log("服务停止")
-    except OSError as e:
-        log("端口 %d 监听失败: %s" % (args.port, e))
-        sys.exit(1)
     except Exception as e:
         log("服务异常: %s" % e)
-        # 致命错误退出，但确保有日志
         sys.exit(2)
+    finally:
+        if args.socket:
+            try:
+                os.remove(args.socket)
+            except OSError:
+                pass
 
 
 if __name__ == "__main__":

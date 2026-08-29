@@ -2,6 +2,40 @@
 
 所有重要变更记录在此文件。格式参照 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.4.1] - 2026-08-29
+
+### 修复
+
+- **修复升级后启动崩溃（「统一网关未就绪」）**：
+  - 根因：部分 fnOS 版本在 `manifest` 缺失 `service_port` 时，会向 `TRIM_SERVICE_PORT` 环境变量注入非法文本（如一段 traceback），`wg-manager.py` 解析 `--port` 默认值时 `int()` 抛 `ValueError`，进程启动即退出、Socket 未创建，`cmd/main` 等待超时报「统一网关 Socket 未就绪」
+  - `manifest` 恢复 `service_port = 51821` + `checkport = false`：按官方文档「不监听固定端口可设置 checkport=false」的方式，仅作声明保留、不检查/不占用端口，避免 fnOS 注入非法值
+  - `wg-manager.py` 新增 `_env_int()`：`--port` 默认值安全解析，`TRIM_SERVICE_PORT` 非法时回退 51821，启动不再受环境变量污染影响
+  - 统一网关接入方式不变：界面仍经 `/app/fn-wg-web` 访问，不开放独立 TCP 端口
+
+## [0.4.0] - 2026-08-29
+
+### 变更
+
+- **改用 fnOS 统一网关代替独立 TCP 端口（开放 API / 网关接入）**：
+  - 应用不再监听 TCP `51821`，Web 管理界面经 fnOS 系统域名统一网关路径 `/app/fn-wg-web` 访问：由 fnOS 校验 NAS 登录态后转发请求，无需在路由器/防火墙开放管理端口
+  - `manifest` 移除 `service_port` / `checkport`（不再有固定 TCP 端口，符合官方「不监听固定端口可省略 service_port」规范）
+  - `ui/config` 注册统一网关入口：`gatewayPrefix=/app/fn-wg-web`、`gatewaySocket=app.sock`（`protocol`/`port` 不再参与路由）
+  - `cmd/main` 启动改为 `wg-manager.py --socket ${TRIM_APPDEST}/app.sock`，等待 Socket 就绪后退出；stop 清理 Socket 文件
+  - `wg-manager.py` 新增 `UnixThreadingHTTPServer`（`ThreadingMixIn + UnixStreamServer`），路由支持剥离网关前缀（`/app/fn-wg-web` 裸路径 302 到带尾斜杠）；`--port` 仅保留给本地开发/联调
+  - 前端 `index.html` / `app.js` 全部改为相对路径（`api/...`、`style.css` 等），使资源与 API 在网关挂载点 `/app/fn-wg-web/` 下正确解析
+  - `ui/index.cgi` 由端口检测页改为跳转到统一网关路径
+  - 访问方式由 `http://NAS_IP:51821` 变为 fnOS 系统域名下 `/app/fn-wg-web`（需已登录 fnOS，可结合应用内密码认证做二次校验）
+
+## [0.3.10] - 2026-08-29
+
+### 变更
+
+- **按 fnOS 官方手册优化 Web 管理端口 51821**：
+  - `manifest` 开启 `checkport = true`（官方默认值）：应用中心在启动应用前检查 `service_port` 是否被占用，与 wg-easy 等同样占用 51821 的服务冲突时会明确报错，不再静默失败
+  - `wg-manager.py` 启动前自检 Web 端口占用：端口被占时给出可操作的错误提示（提示 wg-easy 默认占用 51821、释放端口后重启应用），绑定失败日志同步补充冲突提示
+  - `ui/index.cgi` 回退端口由硬编码 `51821` 改为读取官方环境变量 `TRIM_SERVICE_PORT`（`manifest.service_port` 声明，缺失/非法时回退 51821），与 `manifest` / `ui/config` / `cmd/main` 保持一致
+  - `cmd/main` 本已按官方规范使用 `TRIM_SERVICE_PORT`，无需改动
+
 ## [0.3.9] - 2026-08-14
 
 ### 变更

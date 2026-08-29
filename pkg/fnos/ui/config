@@ -6,9 +6,10 @@
             "desc": "WireGuard 服务端可视化管理",
             "icon": "images/icon.png",
             "type": "iframe",
-            "port": "51821",
-            "protocol": "http",
-            "url": "http://${host}:51821/",
+            "protocol": "",
+            "gatewayPrefix": "/app/fn-wg-web",
+            "gatewaySocket": "app.sock",
+            "url": "/app/fn-wg-web",
             "allUsers": true
         }
     }

@@ -92,7 +92,7 @@ function esc(s) {
 
 async function checkAuthStatus() {
   try {
-    const res = await api("/api/auth/status");
+    const res = await api("api/auth/status");
     state.authEnabled = res.auth_enabled;
     state.authed = res.authed;
     // Bug 12：need_setup 优先于 login 判断，否则首次使用误跳登录表单
@@ -180,7 +180,7 @@ async function doLogin() {
   }
   btn.disabled = true;
   try {
-    const url = mode === "setup" ? "/api/auth/setup" : "/api/auth/login";
+    const url = mode === "setup" ? "api/auth/setup" : "api/auth/login";
     const payload = { password };
     if (oldPassword) payload.old_password = oldPassword;
     const res = await api(url, {
@@ -203,7 +203,7 @@ async function doLogin() {
 
 async function doLogout() {
   try {
-    await api("/api/auth/logout", { method: "POST" });
+    await api("api/auth/logout", { method: "POST" });
   } catch (e) {
     // 忽略登出失败（如 token 已过期）
   }
@@ -217,7 +217,7 @@ async function doLogout() {
 async function disableAuth() {
   if (!confirm("确定关闭密码认证？关闭后任何人可直接访问管理面板。")) return;
   try {
-    await api("/api/auth/disable", { method: "POST" });
+    await api("api/auth/disable", { method: "POST" });
     state.authEnabled = false;
     state.authed = true;
     setCsrfToken("");  // 关闭认证后无需 CSRF
@@ -269,7 +269,7 @@ function setBadge(mode, text) {
 
 async function loadStatus(silent) {
   try {
-    const st = await api("/api/status");
+    const st = await api("api/status");
     state.status = st;
     renderStatus();
     if (!silent) await loadPeers();
@@ -419,7 +419,7 @@ async function deployContainer() {
   btn.disabled = true;
   btn.textContent = "正在部署 Docker 容器（拉取镜像可能需要几分钟）...";
   try {
-    const res = await api("/api/container/deploy", {
+    const res = await api("api/container/deploy", {
       method: "POST",
       body: JSON.stringify(body),
     });
@@ -437,7 +437,7 @@ async function deployContainer() {
 async function removeContainer() {
   if (!confirm("确定移除 wireguard 容器？\n映射目录中的配置数据会保留，如需重新部署可直接再次部署。")) return;
   try {
-    await api("/api/container/remove", { method: "POST" });
+    await api("api/container/remove", { method: "POST" });
     toast("容器已移除", "ok");
     await loadStatus();
     await loadPeers();
@@ -448,7 +448,7 @@ async function removeContainer() {
 
 async function restartContainer() {
   try {
-    const res = await api("/api/container/restart", { method: "POST" });
+    const res = await api("api/container/restart", { method: "POST" });
     toast(res.message, "ok");
     setTimeout(() => loadStatus(), 3000);
   } catch (e) {
@@ -473,7 +473,7 @@ async function saveSettings() {
   const btn = $("saveBtn");
   btn.disabled = true;
   try {
-    const url = state.initDone ? "/api/settings" : "/api/init";
+    const url = state.initDone ? "api/settings" : "api/init";
     const res = await api(url, {
       method: "POST",
       body: JSON.stringify(body),
@@ -497,7 +497,7 @@ async function applyConfig() {
   const btn = $("applyBtn");
   btn.disabled = true;
   try {
-    const res = await api("/api/apply", { method: "POST" });
+    const res = await api("api/apply", { method: "POST" });
     toast(res.message, "ok");
     await loadStatus();
     await loadPeers();
@@ -512,7 +512,7 @@ async function applyConfig() {
 
 async function loadPeers() {
   try {
-    const data = await api("/api/peers");
+    const data = await api("api/peers");
     state.peers = data.peers || [];
     renderPeers();
   } catch (e) {
@@ -638,7 +638,7 @@ async function confirmCreate() {
   btn.disabled = true;
   try {
     if (count === 1) {
-      const res = await api("/api/peers", {
+      const res = await api("api/peers", {
         method: "POST",
         body: JSON.stringify({
           name,
@@ -654,7 +654,7 @@ async function confirmCreate() {
       await loadPeers();
       openDetail(res.peer, res.config);
     } else {
-      const res = await api("/api/peers/batch", {
+      const res = await api("api/peers/batch", {
         method: "POST",
         body: JSON.stringify({
           count,
@@ -680,7 +680,7 @@ async function confirmCreate() {
 async function openDetail(peer, config) {
   if (!config) {
     try {
-      const r = await fetch("/api/peers/" + peer.id + "/config");
+      const r = await fetch("api/peers/" + peer.id + "/config");
       config = await r.text();
     } catch (e) {
       toast("获取配置失败", "err");
@@ -755,7 +755,7 @@ async function confirmRename() {
   const btn = $("renameConfirm");
   btn.disabled = true;
   try {
-    await api("/api/peers/" + state.renamePeerId, {
+    await api("api/peers/" + state.renamePeerId, {
       method: "PUT",
       body: JSON.stringify({ name: newName }),
     });
@@ -775,7 +775,7 @@ async function togglePeer(id) {
   const action = p.enabled !== false ? "停用" : "启用";
   if (!confirm("确定" + action + "客户端「" + p.name + "」？")) return;
   try {
-    await api("/api/peers/toggle", {
+    await api("api/peers/toggle", {
       method: "POST",
       body: JSON.stringify({ id }),
     });
@@ -791,7 +791,7 @@ async function togglePeer(id) {
 
 async function exportConfig() {
   try {
-    const res = await fetch("/api/config/export");
+    const res = await fetch("api/config/export");
     if (!res.ok) throw new Error("导出失败");
     const blob = await res.blob();
     const a = document.createElement("a");
@@ -823,7 +823,7 @@ async function importConfig(e) {
   try {
     const text = await file.text();
     const data = JSON.parse(text);
-    await api("/api/config/import", {
+    await api("api/config/import", {
       method: "POST",
       body: JSON.stringify(data),
     });
@@ -844,7 +844,7 @@ async function deletePeer(id) {
   if (!p) return;
   if (!confirm("确定删除客户端「" + p.name + "」？该设备将立即无法连接。")) return;
   try {
-    await api("/api/peers/" + id, { method: "DELETE" });
+    await api("api/peers/" + id, { method: "DELETE" });
     toast("已删除客户端「" + p.name + "」", "ok");
     await loadStatus(true);
     await loadPeers();
@@ -857,7 +857,7 @@ async function resetServer() {
   if (!confirm("确定重置服务器？\n将删除全部客户端、密钥与配置，且需要重新初始化。")) return;
   if (!confirm("再次确认：此操作不可恢复，所有已生成的客户端配置将失效！")) return;
   try {
-    await api("/api/reset", { method: "POST" });
+    await api("api/reset", { method: "POST" });
     toast("服务器已重置", "ok");
     await loadStatus();
     await loadPeers();
@@ -873,7 +873,7 @@ async function destroyAll() {
   btn.disabled = true;
   btn.textContent = "正在卸载并删除数据...";
   try {
-    const res = await api("/api/container/destroy", { method: "POST" });
+    const res = await api("api/container/destroy", { method: "POST" });
     toast(res.message, "ok");
     await loadStatus();
     await loadPeers();
@@ -952,7 +952,7 @@ function bindEvents() {
     if (act === "qr") openDetail(p);
     else if (act === "dl") {
       state.currentPeer = p;
-      fetch("/api/peers/" + id + "/config")
+      fetch("api/peers/" + id + "/config")
         .then((r) => r.text())
         .then((cfg) => {
           state.currentConfig = cfg;

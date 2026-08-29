@@ -5,7 +5,8 @@
 #   程序文件目录  TRIM_APPDEST  （/usr/local/apps/@appcenter/fn-wg-web/target）
 #   静态配置目录  TRIM_PKGETC   （官方 etc/，→ /vol[x]/@appconf/fn-wg-web）
 #   运行时数据    TRIM_PKGVAR   （官方 var/，→ /vol[x]/@appdata/fn-wg-web）
-#   服务端口      TRIM_SERVICE_PORT（默认 51821）
+#   服务入口      TRIM_SERVICE_PORT（已弃用，改为统一网关）→ 见 ui/config gatewayPrefix/gatewaySocket
+#   网关 Socket   TRIM_APPDEST/app.sock（fnOS 统一网关转发目标）
 #   临时日志      TRIM_TEMP_LOGFILE（生命周期脚本错误输出）
 #   应用名/版本    TRIM_APPNAME / TRIM_APPVER（来自 manifest）
 #
@@ -18,7 +19,7 @@ set -u
 APPDEST="${TRIM_APPDEST:-/usr/local/apps/@appcenter/fn-wg-web/target}"
 ETC_DIR="${TRIM_PKGETC:-/var/apps/fn-wg-web/etc}"
 DATA_DIR="${TRIM_PKGVAR:-/var/apps/fn-wg-web/var}"
-SVC_PORT="${TRIM_SERVICE_PORT:-51821}"
+SOCKET="${WG_SOCKET:-$APPDEST/app.sock}"
 LEGACY_DIR="/usr/fn-wg-web"
 LEGACY_BACKUP="$DATA_DIR/legacy-backup"
 MANAGER="$APPDEST/wg-manager.py"
@@ -102,24 +103,47 @@ start)
         rmdir "$LEGACY_DIR" 2>/dev/null || true
     fi
 
-    # ===== 5) 启动 Web 管理服务 ============================================
-    if ! pgrep -f "wg-manager.py --port ${SVC_PORT}" >/dev/null 2>&1; then
+    # ===== 5) 启动 Web 管理服务（统一网关模式：监听 Unix Socket，不占用 TCP 端口）=====
+    # 清理可能遗留的陈旧 socket 文件（进程已退出时）
+    rm -f "$SOCKET" 2>/dev/null || true
+    if ! pgrep -f "wg-manager.py --socket ${SOCKET}" >/dev/null 2>&1; then
         WG_WEB_BASE="$APPDEST" \
         WG_ETC_BASE="$ETC_DIR" \
         WG_DATA_BASE="$DATA_DIR" \
         WG_LOG_FILE="$LOG_FILE" \
-            nohup python3 -u "$MANAGER" --port "$SVC_PORT" \
+            nohup python3 -u "$MANAGER" --socket "$SOCKET" \
             >>"$LOG_FILE" 2>&1 &
-        sleep 1
+        # 等待 socket 就绪：fnOS 统一网关需要 socket 文件存在后才能转发请求。
+        # 首轮绑定在 Python 侧已提前到模式检测之前，正常情况下 1-2 秒内就绪；
+        # 留足余量（最长 30 秒）避免 docker 探测等慢启动造成误报。
+        i=0
+        while [ "$i" -lt 30 ]; do
+            [ -S "$SOCKET" ] && break
+            sleep 1
+            i=$((i + 1))
+            # 已等待至少 1 秒且进程消失 → 立即失败，避免无限等待
+            if ! pgrep -f "wg-manager.py --socket ${SOCKET}" >/dev/null 2>&1; then
+                break
+            fi
+        done
+        if [ ! -S "$SOCKET" ]; then
+            {
+                echo "[fn-wg-web] 统一网关 Socket 未就绪: $SOCKET"
+                echo "[fn-wg-web] 最近日志（$LOG_FILE）:"
+                tail -n 20 "$LOG_FILE" 2>/dev/null || echo "(日志不可读)"
+            } >>"${TRIM_TEMP_LOGFILE:-/dev/null}" 2>/dev/null || true
+            exit 1
+        fi
     fi
     exit 0
     ;;
 stop)
-    pkill -f "wg-manager.py --port ${SVC_PORT}" 2>/dev/null || true
+    pkill -f "wg-manager.py --socket ${SOCKET}" 2>/dev/null || true
+    rm -f "$SOCKET" 2>/dev/null || true
     exit 0
     ;;
 status)
-    if pgrep -f "wg-manager.py --port ${SVC_PORT}" >/dev/null 2>&1; then
+    if pgrep -f "wg-manager.py --socket ${SOCKET}" >/dev/null 2>&1; then
         exit 0
     else
         exit 3

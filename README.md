@@ -1,7 +1,7 @@
 # WireGuard 管理器（fn-wg-web）
 
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.3.3-green.svg)](#)
+[![Version](https://img.shields.io/badge/version-0.4.1-green.svg)](#)
 [![Platform](https://img.shields.io/badge/platform-fnOS%20x86_64%20%7C%20arm64-orange.svg)](#)
 [![Docker](https://img.shields.io/badge/docker-linuxserver%2Fwireguard-lightgrey.svg)](#)
 
@@ -31,12 +31,12 @@
 
 系统要求：fnOS（Debian 12，x86_64 / arm64）、已启用 Docker、root 权限安装；公网接入需要公网 IP 或 DDNS 域名，并在路由器转发对应 UDP 端口。
 
-1. 下载 `dist/fn-wg-web_0.3.3_all.fpk`
+1. 下载 `dist/fn-wg-web_0.4.1_all.fpk`
 2. 登录飞牛 NAS 桌面 → 应用中心 → 左下角「手动安装」→ 选择 fpk 上传安装
 3. 桌面出现「WireGuard 管理器」图标，打开应用
 4. 填写配置目录映射等参数，点击「部署 WireGuard 容器」（首次自动拉取镜像，约 1-2 分钟）
 
-外部浏览器访问：`http://NAS_IP:51821`
+外部浏览器访问：登录飞牛 NAS 桌面后通过统一网关打开 `http://NAS_IP/app/fn-wg-web`（经 fnOS 登录态校验，无需开放独立管理端口）。
 
 ## 使用指南
 
@@ -76,12 +76,13 @@
 |------|------|
 | `<映射目录>/wg_confs/wg0.conf` | 服务器配置（容器内 wg-quick 加载） |
 | `<映射目录>/` | 客户端配置、密钥、二维码 PNG（容器自动生成） |
-| `/usr/fn-wg-web/` | 管理服务（`wg-manager.py` + `web/`） |
+| `TRIM_APPDEST`（`.../@appcenter/fn-wg-web/target`） | 管理服务（`wg-manager.py` + `web/`）+ 网关 Socket `app.sock` |
 | `/var/apps/fn-wg-web/var/state.json` | 应用配置（官方持久卷，升级/卸载保留） |
-| `/var/log/fn-wg-web.log` | 管理服务日志 |
+| `/var/apps/fn-wg-web/var/fn-wg-web.log` | 管理服务日志（官方持久卷内） |
 
 ## 技术架构
 
+- 访问模型：接入 fnOS 统一网关，不暴露独立 TCP 端口。桌面图标注册 `gatewayPrefix=/app/fn-wg-web` + `gatewaySocket=app.sock`，fnOS 校验登录态后将请求转发到 `${TRIM_APPDEST}/app.sock`（Unix Socket，`wg-manager.py --socket`）
 - 后端：Python 3 标准库 REST API，零第三方依赖；以 root 运行（fpk `install_type=root`）
 - WireGuard 服务端完全运行于 `linuxserver/wireguard` 容器：状态查询走 `docker exec wireguard wg show`，配置应用走「写 `wg0.conf` + `docker restart wireguard`」
 - 客户端密钥对由容器内 `wg genkey` / `wg pubkey` 生成，私钥仅存于 `state.json`
@@ -90,7 +91,7 @@
 
 ### 数据目录策略
 
-配置（`state.json`）存放在 fnOS 官方持久卷 `/var/apps/fn-wg-web/var`（即 `/usr/local/apps/@appdata/fn-wg-web`），由应用中心统一管理。程序文件与数据目录分离：web 静态资源从 `/usr/fn-wg-web` 读取，配置写入持久卷。
+配置（`state.json`）存放在 fnOS 官方持久卷 `/var/apps/fn-wg-web/var`（即 `/usr/local/apps/@appdata/fn-wg-web`），由应用中心统一管理。程序文件与数据目录分离：web 静态资源从 `TRIM_APPDEST`（`/usr/local/apps/@appcenter/fn-wg-web/target`）读取，配置写入持久卷。
 
 ### 升级与卸载语义
 
@@ -115,7 +116,7 @@ fn-wg-web/
 │   │       ├── style.css
 │   │       └── qrcode.min.js
 │   └── fnos/                # fnOS 应用包内容
-│       ├── manifest         # 应用清单（service_port 51821 / install_type root）
+│       ├── manifest         # 应用清单（统一网关接入；service_port 仅声明 + checkport=false，不监听 TCP / install_type root）
 │       ├── cmd/             # 生命周期脚本（main + install/upgrade/uninstall 的 init/callback）
 │       ├── config/          # privilege + resource
 │       ├── ui/              # 桌面入口 + index.cgi + 图标
@@ -151,6 +152,8 @@ WG_WEB_BASE=/tmp/wgm-test python3 pkg/files/wg-manager.py --port 51821
 ## 常见问题
 
 **客户端无法连接？** 确认路由器/NAS 防火墙放行了监听 UDP 端口；确认管理面板中公网 IP/域名（Endpoint）正确；确认客户端使用的是最新导出的配置。
+
+**管理面板打不开？** 应用已接入 fnOS 统一网关（路径 `/app/fn-wg-web`），不再监听独立 TCP 端口 51821。请从飞牛 NAS 桌面点击「WireGuard 管理器」图标，或确认已登录 fnOS 后访问 `http://NAS_IP/app/fn-wg-web`。若提示无法访问，请确认应用为运行中状态并查看 `$TRIM_PKGVAR/fn-wg-web.log` 中是否出现 Socket 监听错误。
 
 **修改配置后不生效？** 「保存设置」仅写入配置，需点击「应用到运行时」重启容器生效。
 
