@@ -2,6 +2,28 @@
 
 所有重要变更记录在此文件。格式参照 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.4.2] - 2026-11-22
+
+### 修复
+
+- **修复「未设置密码，却提示会话已过期、要求重新登录并输入密码」**：
+  - 根因 1：`check_auth()` 在 `password_hash` 为空时返回 `False`，`/api/auth/status` 又谎报 `auth_enabled: true`，导致从未设置过密码的用户一打开面板就被拦到自包含登录页（「设置密码并登录」），所有 API 返回 401；前端 401/403 分支一律弹出登录框，403 还会提示「会话已过期，请重新登录」——用户从未设置密码，却被要求输入密码
+  - 根因 2：`check_csrf()` 只按 `Host` 与 `Origin/Referer` 比较同源，fnOS 统一网关转发时会改写 `Host`，导致所有写操作（含「设置密码」）返回 403，前端又把它翻译成「会话已过期，请重新登录」
+  - 现在密码认证真正成为可选功能：未设置密码或用户主动关闭认证时，面板直接可用，API 正常返回 200，不再出现登录框与「会话已过期」提示
+  - `/api/auth/status` 在未设置密码时返回 `auth_enabled: false`、`authed: true`、`need_setup: true`（`need_setup` 仅作「建议设置密码」的提示，绝不强制跳转）
+  - 前端 `api()`：仅当认证确实启用时才把 401/403 当作需要重新登录，其余情况展示服务端错误原文
+  - 「设置密码」按钮改为在未启用认证时直接可用，不再需要先登录
+
+- **修复设置密码/登录报「CSRF 校验失败」（Issue #4）**：
+  - 新增 `wg_csrf` 双提交 Cookie（非 HttpOnly、`SameSite=Lax`，服务端在客户端缺失时下发），前端读取后放入 `X-CSRF-Token` 头；跨站攻击者既读不到也无法伪造该 Cookie，安全性不降级
+  - `check_csrf()` 改为按「会话 csrf_token → 双提交 Cookie → Origin/Referer 同源（含 `X-Forwarded-Host` 与忽略端口的兜底）」多级校验，兼容 fnOS 统一网关改写 `Host`/端口
+  - 未启用密码认证时直接跳过 CSRF 校验：此时没有登录态可被 CSRF 借用，面板本就对该网络开放，避免网关场景下写操作被误判 403
+  - 自包含登录页同步携带 `X-CSRF-Token`，403 时提示「CSRF 校验失败，请刷新页面后重试」而不是笼统的网络错误
+
+### 变更
+
+- 版本号 0.4.1 → 0.4.2（`manifest`、`wg-manager.py`、`build_fpk.py`、README 徽章与安装包名同步）
+
 ## [0.4.1] - 2026-08-29
 
 ### 修复

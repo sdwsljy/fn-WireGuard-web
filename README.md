@@ -1,7 +1,7 @@
 # WireGuard 管理器（fn-wg-web）
 
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.4.1-green.svg)](#)
+[![Version](https://img.shields.io/badge/version-0.4.2-green.svg)](#)
 [![Platform](https://img.shields.io/badge/platform-fnOS%20x86_64%20%7C%20arm64-orange.svg)](#)
 [![Docker](https://img.shields.io/badge/docker-linuxserver%2Fwireguard-lightgrey.svg)](#)
 
@@ -31,7 +31,7 @@
 
 系统要求：fnOS（Debian 12，x86_64 / arm64）、已启用 Docker、root 权限安装；公网接入需要公网 IP 或 DDNS 域名，并在路由器转发对应 UDP 端口。
 
-1. 下载 `dist/fn-wg-web_0.4.1_all.fpk`
+1. 下载 `dist/fn-wg-web_0.4.2_all.fpk`
 2. 登录飞牛 NAS 桌面 → 应用中心 → 左下角「手动安装」→ 选择 fpk 上传安装
 3. 桌面出现「WireGuard 管理器」图标，打开应用
 4. 填写配置目录映射等参数，点击「部署 WireGuard 容器」（首次自动拉取镜像，约 1-2 分钟）
@@ -59,6 +59,8 @@
 客户端卡片支持以下操作：二维码/配置查看、配置下载、重命名、启用/停用、删除。停用的客户端从 wg0.conf 移除并重启容器生效，配置保留可随时重新启用。列表上方搜索框支持按名称或 IP 实时过滤。
 
 ### 密码认证
+
+密码认证是**可选**功能：未设置密码时，打开管理面板即可直接使用（不会提示登录，也不会提示「会话已过期」）。
 
 在「安全与备份」区块点击「设置密码」可启用密码认证。启用后访问管理面板需输入密码登录（浏览器 Cookie 保持会话）。可随时修改密码或关闭认证。建议在内网之外访问时开启。
 
@@ -163,7 +165,7 @@ WG_WEB_BASE=/tmp/wgm-test python3 pkg/files/wg-manager.py --port 51821
 
 ## 安全说明
 
-管理面板支持密码认证（v0.3.0+），在「安全与备份」区块设置管理密码后，所有网络访问（含内网）均需输入密码登录，API 请求需携带会话令牌。建议始终开启密码认证。未启用密码认证时，管理面板无鉴权，存在安全风险。WireGuard 使用 UDP 协议，请确保防火墙放行监听端口。首次部署需要 NAS 能够访问 Docker Hub（网络异常时可在 Docker 设置中配置镜像加速）。
+管理面板支持密码认证（v0.3.0+），在「安全与备份」区块设置管理密码后，所有网络访问（含内网）均需输入密码登录，API 请求需携带会话令牌。建议始终开启密码认证。未启用密码认证时，管理面板无鉴权（打开即可用），存在安全风险。WireGuard 使用 UDP 协议，请确保防火墙放行监听端口。首次部署需要 NAS 能够访问 Docker Hub（网络异常时可在 Docker 设置中配置镜像加速）。
 
 ## License
 

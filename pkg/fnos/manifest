@@ -1,5 +1,5 @@
 appname         = fn-wg-web
-version         = 0.4.1
+version         = 0.4.2
 display_name    = WireGuard 管理器
 platform        = all
 maintainer      = 胖啥胖
@@ -15,7 +15,7 @@ checkport       = false
 install_type    = root
 os_min_version  = 0.9.0
 disable_authorization_path = true
-changelog       = 0.4.1：修复启动崩溃 —— 部分 fnOS 在 manifest 无 service_port 时会向 TRIM_SERVICE_PORT 注入非法文本，导致 wg-manager.py 解析 --port 时 int() 崩溃、Socket 无法创建而报「统一网关未就绪」。现恢复 service_port=51821 + checkport=false（仅声明、不检查端口，统一网关仍不占用 TCP 端口），并让 --port 默认值安全解析（非法值回退 51821），启动不再受环境变量污染影响。0.4.0 改用统一网关（/app/fn-wg-web）代替独立端口。
+changelog       = 0.4.2：修复「未设置密码却提示会话已过期、要求重新登录并输入密码」——密码认证改为可选：未设置密码时管理面板直接可用，不再强制跳转设置/登录页；未启用认证时 API 不再返回 401/403，前端也不会再把 403 误报成「会话已过期」。同时修复设置密码报「CSRF 校验失败」（Issue #4）：新增 wg_csrf 双提交 Cookie，并兼容 fnOS 统一网关改写 Host/Origin 的场景，登录/设置密码/写操作在网关下均可正常通过校验。
 desc            = WireGuard 管理器：在飞牛 NAS 上以 Docker 容器一键部署 WireGuard 服务端，浏览器全程可视化操作，无需命令行。点击部署自动拉取镜像、创建容器并生成密钥；支持填写公网 IP/域名、自定义 UDP 端口与内网网段、配置目录映射；一键创建/批量生成客户端，二维码与配置文件即扫即用；提供分流路由、在线状态、握手时间与实时流量统计。配置存于官方持久卷，升级不丢失，数据更安心。
 source          = thirdparty
 checksum        =

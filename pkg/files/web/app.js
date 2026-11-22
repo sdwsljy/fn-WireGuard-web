@@ -12,6 +12,7 @@ const state = {
   currentConfig: "",
   initDone: false,
   authEnabled: false,
+  hasPassword: false,   // 是否已设置过管理密码（用于「修改密码」需旧密码的判断）
   authed: false,
   searchQuery: "",
   renamePeerId: null,
@@ -33,8 +34,18 @@ function toast(msg, type) {
   }, 3200);
 }
 
+function readCookie(name) {
+  try {
+    const m = document.cookie.match(new RegExp("(?:^|; )" + name + "=([^;]*)"));
+    return m ? decodeURIComponent(m[1]) : "";
+  } catch (e) {
+    return "";
+  }
+}
+
 function getCsrfToken() {
-  // 优先内存，其次 localStorage（多页签/刷新后保留）
+  // 优先内存，其次 localStorage（登录后由后端下发），最后 wg_csrf Cookie
+  // （双提交 Cookie：fnOS 统一网关改写 Host/Origin 时仍能通过 CSRF 校验）
   if (state.csrfToken) return state.csrfToken;
   try {
     const v = localStorage.getItem("wg_csrf");
@@ -43,6 +54,11 @@ function getCsrfToken() {
       return v;
     }
   } catch (e) { /* localStorage 不可用 */ }
+  const c = readCookie("wg_csrf");
+  if (c) {
+    state.csrfToken = c;
+    return c;
+  }
   return "";
 }
 
@@ -63,17 +79,26 @@ async function api(path, opts) {
     if (csrf) headers["X-CSRF-Token"] = csrf;
   }
   const res = await fetch(path, { headers, ...opts });
+  const data = await res.json().catch(() => ({}));
   if (res.status === 401) {
+    // 后端只在「已启用密码认证但未登录」时返回 401（未设置密码时不会 401），
+    // 因此这里可以放心弹出登录框；顺带纠正本地缓存的认证状态。
+    state.authEnabled = true;
+    state.authed = false;
     showLogin("login");
-    throw new Error("请先登录");
+    throw new Error(data.error || "请先登录");
   }
   if (res.status === 403) {
-    // CSRF 校验失败 → 清空 token 让用户重新登录
     setCsrfToken("");
-    showLogin("login");
-    throw new Error("会话已过期，请重新登录");
+    if (state.authEnabled) {
+      // CSRF 校验失败 → 清空 token 让用户重新登录
+      state.authed = false;
+      showLogin("login");
+      throw new Error("会话已过期，请重新登录");
+    }
+    // 未启用密码认证时没有会话可过期，不要把 403 误报成「会话已过期」
+    throw new Error(data.error || "请求被拒绝（可用刷新页面重试）");
   }
-  const data = await res.json().catch(() => ({}));
   if (!res.ok || data.ok === false) {
     throw new Error(data.error || ("请求失败 HTTP " + res.status));
   }
@@ -94,7 +119,9 @@ async function checkAuthStatus() {
   try {
     const res = await api("api/auth/status");
     state.authEnabled = res.auth_enabled;
+    state.hasPassword = !!res.has_password;
     state.authed = res.authed;
+    // 未设置密码时后端返回 authed=true：面板直接可用，绝不弹登录/设置框
     // Bug 12：need_setup 优先于 login 判断，否则首次使用误跳登录表单
     if (res.need_setup && !res.authed) {
       showLogin("setup");
@@ -124,12 +151,13 @@ function showLogin(mode) {
   confirm.value = "";
   if (oldPwdField) oldPwdField.querySelector("input").value = "";
   if (mode === "setup") {
-    title.textContent = state.authEnabled ? "修改管理密码" : "设置管理密码";
-    label.textContent = state.authEnabled ? "新密码" : "设置密码";
+    const changing = state.hasPassword;  // 已有密码（含「已关闭认证但密码仍在」的情况）
+    title.textContent = changing ? "修改管理密码" : "设置管理密码";
+    label.textContent = changing ? "新密码" : "设置密码";
     confirmField.classList.remove("hidden");
-    pwd.placeholder = state.authEnabled ? "输入新密码（至少 4 位）" : "设置管理密码（至少 4 位）";
-    // Bug 6：已启用密码时显示旧密码字段
-    if (state.authEnabled && oldPwdField) {
+    pwd.placeholder = changing ? "输入新密码（至少 4 位）" : "设置管理密码（至少 4 位）";
+    // Bug 6：已有密码时必须校验旧密码
+    if (changing && oldPwdField) {
       oldPwdField.classList.remove("hidden");
     } else if (oldPwdField) {
       oldPwdField.classList.add("hidden");
@@ -166,8 +194,8 @@ async function doLogin() {
       toast("密码长度至少 4 位", "err");
       return;
     }
-    // Bug 6：已启用密码时必须输入旧密码
-    if (state.authEnabled) {
+    // Bug 6：已有密码时必须输入旧密码
+    if (state.hasPassword) {
       const oldInput = $("loginOld");
       if (oldInput) {
         oldPassword = oldInput.value.trim();
@@ -190,6 +218,7 @@ async function doLogin() {
     modal.hidden = true;
     state.authed = true;
     state.authEnabled = true;
+    state.hasPassword = true;
     toast(res.message, "ok");
     updateAuthUI();
     await loadStatus();
@@ -242,19 +271,17 @@ function updateAuthUI() {
   } else {
     badge.textContent = "未启用";
     badge.className = "auth-badge off";
-    btn.textContent = "设置密码";
+    // 已设置过密码但用户主动关闭了认证 → 仍然展示「修改密码」
+    btn.textContent = state.hasPassword ? "修改密码" : "设置密码";
     logoutBtn.classList.add("hidden");
     disableBtn.classList.add("hidden");
   }
 }
 
 function openAuthSetup() {
-  if (state.authEnabled) {
-    // 已启用 → 修改密码（需先登录，已登录则直接设置）
-    showLogin("setup");
-  } else {
-    showLogin("setup");
-  }
+  // 已启用认证 → 修改密码（需先登录）；未启用但已有密码 → 修改密码（需旧密码）；
+  // 从未设置过密码 → 首次设置。showLogin("setup") 会按 state.hasPassword 自动区分。
+  showLogin("setup");
 }
 
 /* ---------------- 状态徽章 ---------------- */

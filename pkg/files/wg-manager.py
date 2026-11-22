@@ -32,7 +32,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-VERSION = "0.4.1"
+VERSION = "0.4.2"
 
 # 状态文件写入锁（并发请求下防止 tmp 文件竞争）
 _state_lock = threading.Lock()
@@ -49,6 +49,10 @@ MAX_BODY = 10 * 1024 * 1024   # 10MB 请求体上限（Bug 14）
 
 # CSRF：受保护方法（Bug 1）
 _CSRF_METHODS = ("POST", "PUT", "DELETE", "PATCH")
+
+# CSRF 双提交 Cookie 名（非 HttpOnly，前端 JS 可读；用于 fnOS 统一网关
+# 改写 Host/Origin 后仍然能够完成 CSRF 校验，修复 Issue #4「CSRF 校验失败」）
+_CSRF_COOKIE = "wg_csrf"
 
 
 class _BodyTooLarge(Exception):
@@ -555,25 +559,30 @@ def _gc_sessions(sessions, now=None):
     return kept
 
 
+def _get_cookie(handler, name):
+    """读取请求 Cookie 中的指定字段，不存在返回空串。"""
+    cookie_header = handler.headers.get("Cookie", "") or ""
+    for part in cookie_header.split(";"):
+        part = part.strip()
+        if part.startswith(name + "="):
+            return part[len(name) + 1:]
+    return ""
+
+
 def check_auth(handler):
     """检查请求是否已认证。
-    - 未设置密码 → 返回 False（强制进入设置流程）
-    - 已设置密码但未启用认证 → 返回 True
+    - 未设置密码 → 返回 True：密码认证是可选功能，未设置时面板直接可用
+      （0.4.1 及以前这里返回 False 且 auth/status 谎报 auth_enabled=True，
+       导致从未设置过密码的用户被强制要求「设置密码/登录」，并不断收到
+       「会话已过期，请重新登录」的误导提示）
+    - 已设置密码但未启用认证（用户主动关闭）→ 返回 True
     - 认证已启用 → 校验 Cookie 中的会话令牌是否在 sessions 列表中且未过期
     """
     state = load_state()
     a = state.get("auth", {})
-    if not a.get("password_hash"):
-        return False
-    if not a.get("enabled"):
+    if not a.get("password_hash") or not a.get("enabled"):
         return True
-    token = ""
-    cookie_header = handler.headers.get("Cookie", "")
-    for part in cookie_header.split(";"):
-        part = part.strip()
-        if part.startswith("wg_token="):
-            token = part[len("wg_token="):]
-            break
+    token = _get_cookie(handler, "wg_token")
     if not token:
         return False
     token_h = hash_token(token)
@@ -600,34 +609,63 @@ def check_auth(handler):
 def check_csrf(handler, allow_origin_only=False):
     """CSRF 校验（Bug 1）：
     - GET/HEAD/OPTIONS 不校验
-    - 优先校验 X-CSRF-Token 头
-    - 兜底校验 Origin/Referer 与 Host 同源
-    - allow_origin_only=True：允许仅通过 Origin 同源通过（setup/login 等无会话场景）
+    - 未启用密码认证（未设置密码 / 用户已关闭）→ 直接放行：此时没有任何
+      登录态可被 CSRF 借用，面板本身就对本网络开放，若强行校验只会在
+      fnOS 统一网关改写 Host/Origin 时把所有写操作误判为 403
+      （表现为前端提示「会话已过期，请重新登录」）
+    - 认证已启用 → 依次校验：
+        1) X-CSRF-Token 头与会话中的 csrf_token（登录后由后端下发）
+        2) X-CSRF-Token 头与 wg_csrf 双提交 Cookie（网关改写 Host 也可用）
+        3) Origin / Referer 与 Host / X-Forwarded-Host 同源（含忽略端口的兜底）
+        4) 完全没有 Origin（curl/脚本等非浏览器客户端）→ 只要有有效会话即放行
+           （浏览器跨站请求必带 Origin，且 wg_token 为 SameSite=Strict）
+    - allow_origin_only：仅为兼容旧调用保留，行为与默认一致
     返回 True 表示通过。
     """
     if handler.command not in _CSRF_METHODS:
         return True
-    # 1) 优先 X-CSRF-Token 头校验（前端登录后取得，存 localStorage）
-    csrf = handler.headers.get("X-CSRF-Token", "")
+    state = load_state()
+    if not auth_enabled(state):
+        return True
+    # 1) 会话内 csrf_token（登录后保存在前端 localStorage）
+    csrf = (handler.headers.get("X-CSRF-Token", "") or "").strip()
     if csrf:
-        state = load_state()
         for s in state.get("auth", {}).get("sessions") or []:
             if s.get("csrf_token") and secrets.compare_digest(csrf, s["csrf_token"]):
                 return True
-        if not allow_origin_only:
-            return False
-    # 2) 兜底：Origin / Referer 同源
-    host = handler.headers.get("Host", "")
-    origin = handler.headers.get("Origin", "") or handler.headers.get("Referer", "")
-    if not host or not origin:
-        return False
+        # 2) 双提交 Cookie：Cookie 由服务端下发，跨站攻击者既读不到也改不了
+        cookie_csrf = _get_cookie(handler, _CSRF_COOKIE)
+        if cookie_csrf and secrets.compare_digest(csrf, cookie_csrf):
+            return True
+    # 3) 兜底：Origin / Referer 与 Host 同源（兼容网关把 Host 改写成内网地址）
+    from urllib.parse import urlparse as _up
+    host = (handler.headers.get("Host", "") or "").strip().lower()
+    fwd_host = (handler.headers.get("X-Forwarded-Host", "") or "").split(",")[0].strip().lower()
+    origin = handler.headers.get("Origin", "") or handler.headers.get("Referer", "") or ""
+    if not origin:
+        # 非浏览器客户端（curl / 脚本 / 部分网关）不会带 Origin。浏览器发起的
+        # POST 一定会带 Origin，且 wg_token 是 SameSite=Strict（跨站根本不会被
+        # 携带），因此「无 Origin + 有效会话」不构成 CSRF，按已认证放行。
+        return check_auth(handler)
     try:
-        from urllib.parse import urlparse as _up
         o = _up(origin)
-        origin_authority = o.netloc.lower()  # host:port
-        return secrets.compare_digest(origin_authority, host.lower())
+        origin_authority = (o.netloc or "").lower()   # host:port
+        origin_hostname = (o.hostname or "").lower()  # 仅主机名
     except Exception:
         return False
+    if not origin_authority:
+        return False
+    if host and secrets.compare_digest(origin_authority, host):
+        return True
+    if fwd_host and secrets.compare_digest(origin_authority, fwd_host):
+        return True
+    # 网关可能改写端口（如后端看到 127.0.0.1:xxxxx，浏览器来源是 NAS 域名），
+    # 此时退化为「主机名一致即同源」：Origin 由浏览器强制写入，跨站无法伪造。
+    if origin_hostname and host and secrets.compare_digest(origin_hostname, host.split(":")[0]):
+        return True
+    if origin_hostname and fwd_host and secrets.compare_digest(origin_hostname, fwd_host.split(":")[0]):
+        return True
+    return False
 
 
 # 登录失败速率限制（Bug 8）
@@ -1296,6 +1334,21 @@ class Handler(BaseHTTPRequestHandler):
                 p = "/"
         return p
 
+    def end_headers(self):
+        """响应收尾：客户端还没有 wg_csrf 时下发双提交 CSRF Cookie。
+
+        非 HttpOnly（前端 JS 需要读取它放进 X-CSRF-Token 头），SameSite=Lax
+        保证同站页面可读写。只在缺失时下发，避免每次响应刷新值导致前后端不匹配。
+        """
+        try:
+            if not _get_cookie(self, _CSRF_COOKIE):
+                self.send_header(
+                    "Set-Cookie",
+                    "%s=%s; Path=/; SameSite=Lax" % (_CSRF_COOKIE, secrets.token_hex(16)))
+        except Exception:
+            pass
+        BaseHTTPRequestHandler.end_headers(self)
+
     # ---- 路由 ----
     def do_GET(self):
         try:
@@ -1571,6 +1624,10 @@ document.getElementById("pwd").addEventListener("keydown",function(e){
 document.getElementById("confirmPwd").addEventListener("keydown",function(e){
   if(e.key==="Enter")doSubmit();
 });
+function readCookie(n){
+  var m=document.cookie.match(new RegExp("(?:^|; )"+n+"=([^;]*)"));
+  return m?decodeURIComponent(m[1]):"";
+}
 function doSubmit(){
   var pwd=document.getElementById("pwd").value;
   var err=document.getElementById("errMsg");
@@ -1585,8 +1642,12 @@ function doSubmit(){
   btn.disabled=true;
   btn.textContent="请稍候...";
   var url=mode==="setup"?"api/auth/setup":"api/auth/login";
-  fetch(url,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({password:pwd})})
-    .then(function(r){return r.json()})
+  // 双提交 CSRF：把服务端下发的 wg_csrf Cookie 原样放进请求头
+  fetch(url,{method:"POST",headers:{"Content-Type":"application/json","X-CSRF-Token":readCookie("wg_csrf")},body:JSON.stringify({password:pwd})})
+    .then(function(r){
+      if(r.status===403){throw new Error("CSRF 校验失败，请刷新页面后重试");}
+      return r.json();
+    })
     .then(function(d){
       if(d.ok){
         location.reload();
@@ -1596,8 +1657,8 @@ function doSubmit(){
         btn.textContent=mode==="setup"?"设置密码并登录":"登录";
       }
     })
-    .catch(function(){
-      err.textContent="网络错误，请重试";
+    .catch(function(e){
+      err.textContent=(e&&e.message)||"网络错误，请重试";
       btn.disabled=false;
       btn.textContent=mode==="setup"?"设置密码并登录":"登录";
     });
@@ -1619,13 +1680,15 @@ function doSubmit(){
         a = state.get("auth", {})
         has_password = bool(a.get("password_hash"))
         enabled = auth_enabled(state)
-        # 未设置密码 → 需要设置（强制设置页）；auth_enabled 返回 True 以触发登录页显示设置表单
         if not has_password:
+            # 未设置密码：密码认证是可选功能，面板直接可用（authed=True），
+            # need_setup 只作为「建议设置密码」的提示，绝不强制跳转登录/设置页。
             self._json({
                 "ok": True,
-                "auth_enabled": True,
-                "authed": False,
+                "auth_enabled": False,
+                "authed": True,
                 "need_setup": True,
+                "has_password": False,
             })
             return
         authed = check_auth(self) if enabled else True
@@ -1634,6 +1697,7 @@ function doSubmit(){
             "auth_enabled": enabled,
             "authed": authed,
             "need_setup": False,
+            "has_password": True,
         })
 
     def _issue_session(self, state, handler):
